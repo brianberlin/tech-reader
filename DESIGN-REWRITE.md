@@ -1,6 +1,6 @@
 # tech-reader — Rewrite Design Specification
 
-**Status:** Build-ready architecture spec • **Audience:** A fresh engineer with no prior context • **Date:** 2026-06-22
+**Status:** Build-ready architecture spec • **Audience:** A fresh engineer with no prior context • **Date:** 2026-06-22 • **Language: Rust — LOCKED 2026-06-22**
 
 ---
 
@@ -8,7 +8,9 @@
 
 tech-reader reads source code, comments, and design/spec markdown **aloud but explained** (not read verbatim): a local Ollama LLM rewrites each block into spoken prose, a local neural TTS speaks it, and a full-screen TUI shows the scrolling narration with the current sentence highlighted. Everything runs on-device (no cloud LLM, no cloud TTS). The product exists today as a TypeScript/Node CLI; this spec governs a rewrite whose two goals are (a) **eliminate the awkward inter-sentence audio gaps** and (b) ship a **single self-contained executable**.
 
-### Recommendation: **Rust**
+### Decision: **Rust** — LOCKED 2026-06-22
+
+**This is a committed decision, not a recommendation.** The language evaluation below (§4) and the Go/Elixir analysis are retained as the *rationale of record* for why Rust was chosen; they are no longer open for re-litigation. All implementation work (§5–§10) proceeds in Rust.
 
 Rust wins because the hard part of this project is **gapless continuous audio**, and Rust uniquely combines three things the other candidates cannot all deliver:
 
