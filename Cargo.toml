@@ -1,0 +1,52 @@
+[package]
+name = "tech-reader"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Reads source code, comments, and specs aloud-but-explained: local Ollama narration + local neural TTS + a gapless TUI reader."
+license = "MIT"
+
+[[bin]]
+name = "tech-reader"
+path = "src/main.rs"
+
+[dependencies]
+# --- TTS runtime + models (in-process VITS/Piper + Kokoro -> f32 PCM) ---
+# Pinned exactly: sherpa-onnx-sys derives its prebuilt-onnxruntime archive URL
+# from CARGO_PKG_VERSION, which must match a published GitHub release tag.
+sherpa-onnx = "=1.13.3"
+
+# --- Gapless audio output ---
+cpal = "0.18"          # persistent output stream; RT callback drains a ring buffer
+rtrb = "0.3"           # wait-free SPSC ring buffer for the audio thread
+
+# --- Async runtime / orchestration (Ollama stream lands in M2) ---
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio-util = "0.7"     # CancellationToken (tokio_util::sync)
+
+# --- HTTP / Ollama NDJSON streaming (M2) ---
+reqwest = { version = "0.13", features = ["stream", "json"] }  # 0.13 defaults to rustls — no OpenSSL
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
+
+# --- Text processing ---
+unicode-segmentation = "1.13"  # sentence boundaries (replaces Intl.Segmenter)
+
+# --- TUI (M4) ---
+ratatui = "0.30"       # default features pull in the crossterm backend
+crossterm = "0.29"     # matches ratatui 0.30's crossterm
+
+# --- Assets / provisioning (M6) ---
+rust-embed = "8"
+directories = "6"      # macOS cache dir (~/Library/Caches/...)
+sha2 = "0.11"          # sha256 verify of downloaded voices
+
+# --- Errors ---
+anyhow = "1.0"
+thiserror = "2"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

@@ -2,3 +2,14 @@ node_modules/
 dist/
 *.vsix
 .DS_Store
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Dev artifacts: voice-model cache + rendered audio / logs (never commit large .onnx)
+/voices/
+/out/
+/build/onnxruntime-*
+*.onnx
+*.onnx.json
