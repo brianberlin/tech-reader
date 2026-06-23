@@ -515,7 +515,7 @@ fn feed(
             .unwrap()
             .push((cumulative, pcm.sentence_index));
 
-        let resampled = resample_linear(&pcm.samples, pcm.sample_rate, device_rate);
+        let resampled = resample(&pcm.samples, pcm.sample_rate, device_rate);
         // Trim the voice's own leading/trailing near-silence so the only gap
         // between sentences is our exact, tunable inter-sentence silence (N1).
         let (s, e) = speech_bounds(&resampled, 0.008, trim_margin);
@@ -643,21 +643,38 @@ fn push_slice(
     }
 }
 
-/// Linear-interpolation resampler (mono). M0-grade; replaced by `rubato` in M6.
-fn resample_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+/// Cubic (Catmull-Rom) resampler, mono (M6 — replaces the M0 linear one).
+///
+/// Each sentence is resampled independently (so the feeder can trim per-sentence
+/// silence and ramp the joins), so a one-shot interpolator is the right fit — no
+/// cross-sentence state and no group-delay bookkeeping the way a stateful sinc
+/// resampler (e.g. `rubato`) would need. Catmull-Rom's 4-tap kernel removes the
+/// linear interpolator's high-frequency imaging on upsampling (16/22/24 kHz →
+/// the 44.1/48 kHz device rate) at negligible cost.
+fn resample(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if input.is_empty() || src_rate == dst_rate {
         return input.to_vec();
     }
     let ratio = dst_rate as f64 / src_rate as f64;
     let out_len = ((input.len() as f64) * ratio).round() as usize;
+    let n = input.len();
+    // Clamp to the edge sample at the boundaries (avoids reaching past the ends).
+    let at = |i: isize| -> f32 { input[i.clamp(0, n as isize - 1) as usize] };
+
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let pos = i as f64 / ratio;
-        let idx = pos.floor() as usize;
-        let frac = (pos - idx as f64) as f32;
-        let a = input.get(idx).copied().unwrap_or(0.0);
-        let b = input.get(idx + 1).copied().unwrap_or(a);
-        out.push(a + (b - a) * frac);
+        let idx = pos.floor() as isize;
+        let t = (pos - idx as f64) as f32;
+        let p0 = at(idx - 1);
+        let p1 = at(idx);
+        let p2 = at(idx + 1);
+        let p3 = at(idx + 2);
+        // Catmull-Rom basis.
+        let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+        let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+        let c = -0.5 * p0 + 0.5 * p2;
+        out.push(((a * t + b) * t + c) * t + p1);
     }
     out
 }
@@ -726,6 +743,37 @@ mod tests {
         assert_eq!(sentence_at(&b, 2500), Some(2));
         assert_eq!(sentence_at(&b, 9_999), Some(2)); // past the last start -> last
         assert_eq!(sentence_at(&[], 5), None); // nothing fed yet
+    }
+
+    #[test]
+    fn resample_identity_and_shapes() {
+        let x = vec![0.1, 0.2, 0.3, 0.4];
+        assert_eq!(resample(&x, 16000, 16000), x); // same rate -> untouched
+        assert!(resample(&[], 16000, 44100).is_empty());
+        let up = resample(&x, 16000, 44100);
+        let expect = (x.len() as f64 * 44100.0 / 16000.0).round() as usize;
+        assert_eq!(up.len(), expect);
+    }
+
+    #[test]
+    fn resample_reproduces_linear_and_constant() {
+        // Catmull-Rom is exact for linear signals in the interior (where all four
+        // taps are real samples); only the edge-clamped boundary deviates.
+        let n = 32;
+        let ramp: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let up = resample(&ramp, 1000, 2000); // 2x
+        for (i, &v) in up.iter().enumerate() {
+            let pos = i as f32 / 2.0;
+            if pos < 1.0 || pos > (n - 2) as f32 {
+                continue; // boundary taps are clamped
+            }
+            assert!((v - pos).abs() < 1e-3, "i={i} got {v} want {pos}");
+        }
+        // Constant in -> constant out.
+        let flat = vec![0.5f32; 20];
+        for v in resample(&flat, 16000, 44100) {
+            assert!((v - 0.5).abs() < 1e-4);
+        }
     }
 
     #[test]

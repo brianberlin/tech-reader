@@ -6,11 +6,40 @@ local neural TTS speaks it, and a full-screen TUI shows the scrolling narration
 with the current sentence highlighted. Everything runs on-device: no cloud LLM,
 no cloud TTS, no telemetry.
 
-> **Status:** Rewrite in progress. This repository was previously a TypeScript
-> VS Code extension + CLI; it is being rebuilt as a single self-contained Rust
-> TUI binary whose central goal is **gapless** continuous audio. See
-> [`DESIGN-REWRITE.md`](DESIGN-REWRITE.md) for the full architecture spec and
-> milestone plan; the prior TypeScript implementation lives in the git history.
+> **Status:** The Rust rewrite (milestones M0–M6 of
+> [`DESIGN-REWRITE.md`](DESIGN-REWRITE.md)) is implemented: gapless audio spine,
+> segmentation + offline/Ollama narration, look-ahead/caching/failure handling,
+> the TUI with audible-sentence highlight, transport (pause/seek/speed), and
+> first-run voice provisioning + packaging. This repository was previously a
+> TypeScript VS Code extension + CLI; that implementation lives in the git
+> history.
+
+## Install
+
+```sh
+# Homebrew (prebuilt, no compile)
+brew tap nberl-in/tech-reader && brew install tech-reader
+
+# or curl | sh
+curl -fsSL https://raw.githubusercontent.com/nberl-in/tech-reader/main/packaging/install.sh | sh
+```
+
+Both deliver one self-contained binary (onnxruntime static-linked); the neural
+voice is downloaded + SHA-256-verified on first run, then everything is offline.
+For AI-explained narration, run a local [Ollama](https://ollama.com) and
+`ollama pull llama3.2` — without it, a deterministic offline humanizer is used.
+See [`PACKAGING.md`](PACKAGING.md) for the build/release details.
+
+## Usage
+
+```sh
+tech-reader path/to/file.rs      # narrate a source file or markdown doc
+tech-reader --text path/to/file  # print the narration; no audio
+tech-reader --help               # all options
+```
+
+Controls: `space` pause · `←/→` seek · `−/+` speed · `↑/↓` scroll · `f` follow ·
+`q` quit.
 
 ## Why a rewrite
 
@@ -36,9 +65,12 @@ macOS arm64 is the primary, must-work target; Linux is best-effort.
 
 ## Voices
 
-Voice models are not committed. For development, place a sherpa-onnx voice bundle
-under `voices/` (e.g. `vits-piper-en_US-amy-low/`). First-run download +
-verification is part of milestone M6.
+On first run, tech-reader downloads its voice to
+`~/Library/Application Support/tech-reader/voices` and verifies it against a
+pinned SHA-256 ([`src/voices.rs`](src/voices.rs)); later runs are offline. For
+development, point `TECH_READER_VOICE_DIR` at an already-extracted sherpa-onnx
+voice bundle (e.g. `voices/vits-piper-en_US-amy-low/`) to skip the download.
+Voice models are never committed.
 
 ## License
 

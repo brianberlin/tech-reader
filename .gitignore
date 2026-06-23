@@ -7,6 +7,9 @@
 # Dev artifacts: voice-model cache + rendered audio / logs (never commit large .onnx)
 /voices/
 /out/
+/dist/
+# Ignore the downloaded onnxruntime archive, but keep its committed sha256 pin.
 /build/onnxruntime-*
+!/build/onnxruntime-*.sha256
 *.onnx
 *.onnx.json

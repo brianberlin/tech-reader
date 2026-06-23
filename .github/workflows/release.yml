@@ -1,0 +1,96 @@
+# Release build & packaging (DESIGN-REWRITE §9).
+#
+# On a version tag, builds one self-contained Mach-O per macOS arch (onnxruntime
+# is static-linked into the binary — no .dylib shipped, §9.1), packages each as a
+# tarball, and attaches them to a GitHub release. The Homebrew formula's per-arch
+# sha256 are filled from the printed digests.
+#
+# Reproducibility (§9.1): the sherpa-onnx build downloads a prebuilt onnxruntime
+# archive on the first build; we cache it keyed by crate version + target so
+# later builds are offline and identical. The first run records its sha256 into
+# build/onnxruntime-<target>.sha256 (commit it to pin the archive).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64-darwin
+            runner: macos-14 # Apple Silicon
+          - target: x86_64-apple-darwin
+            arch: x86_64-darwin
+            runner: macos-13 # Intel (best-effort, N5)
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (pinned)
+        run: |
+          rustup toolchain install 1.85 --profile minimal
+          rustup default 1.85
+          rustup target add ${{ matrix.target }}
+
+      # Cache the onnxruntime archive sherpa-onnx-sys downloads, keyed by the
+      # crate version + target, so builds after the first are offline (§9.1).
+      - name: Cache onnxruntime prebuilt
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sherpa-onnx
+          key: onnxruntime-${{ matrix.target }}-sherpa1.13.3
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (release, static onnxruntime)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Record onnxruntime archive sha256 (pin reference)
+        run: |
+          mkdir -p build
+          find ~ -iname '*onnxruntime*osx*' \( -name '*.tgz' -o -name '*.tar.*' -o -name '*.zip' \) \
+            -exec shasum -a 256 {} \; | tee build/onnxruntime-${{ matrix.arch }}.sha256 || true
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -n "$VERSION" ] || VERSION="0.0.0-dev"
+          NAME="tech-reader-${VERSION}-${{ matrix.arch }}"
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/tech-reader" "dist/$NAME/"
+          cp README.md LICENSE "dist/$NAME/" 2>/dev/null || true
+          tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
+          SHA=$(shasum -a 256 "dist/${NAME}.tar.gz" | awk '{print $1}')
+          echo "tarball=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "::notice title=${{ matrix.arch }} bottle sha256::$SHA  (paste into the Homebrew formula)"
+
+      - name: Verify the binary is self-contained (no bundled onnxruntime dylib)
+        run: |
+          BIN="target/${{ matrix.target }}/release/tech-reader"
+          otool -L "$BIN" || true
+          if otool -L "$BIN" | grep -qi 'onnxruntime'; then
+            echo "ERROR: binary links a shared onnxruntime — static link expected (§9.1)"; exit 1
+          fi
+          codesign -dv "$BIN" 2>&1 | grep -qi 'adhoc' && echo "ad-hoc signed (expected, §9.4)" || true
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            build/onnxruntime-${{ matrix.arch }}.sha256

@@ -19,6 +19,7 @@ mod transport;
 mod tts;
 mod tui;
 mod types;
+mod voices;
 mod wav;
 
 use std::collections::HashSet;
@@ -105,6 +106,14 @@ fn parse_args() -> std::result::Result<Args, AppError> {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(exit::OK);
+            }
+            "--version" | "-V" => {
+                println!("tech-reader {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(exit::OK);
+            }
             "--text" | "--no-audio" => text_only = true,
             "--model" | "-m" => match it.next() {
                 Some(v) => model = v,
@@ -167,14 +176,6 @@ fn lang_from_path(path: &Path) -> String {
     lang.to_string()
 }
 
-/// M3 voice: the locally pre-extracted dev voice. Real first-run provisioning
-/// lands in M6.
-fn voice_dir() -> PathBuf {
-    std::env::var("TECH_READER_VOICE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("voices/vits-piper-en_US-amy-low"))
-}
-
 /// PCM cache byte budget from `TECH_READER_CACHE_MB` (default `DEFAULT_CACHE_MB`).
 fn cache_cap_bytes() -> usize {
     std::env::var("TECH_READER_CACHE_MB")
@@ -182,6 +183,39 @@ fn cache_cap_bytes() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_CACHE_MB)
         .saturating_mul(1024 * 1024)
+}
+
+fn print_usage() {
+    println!(
+        "tech-reader {} — reads code, comments, and specs aloud-but-explained.
+
+USAGE:
+    tech-reader [OPTIONS] [FILE]
+
+    With no FILE, narrates a short welcome. FILE may be source code or markdown.
+
+OPTIONS:
+    -m, --model <NAME>    Ollama model for AI narration (default: {DEFAULT_MODEL})
+        --ollama <URL>    Ollama base URL (default: {DEFAULT_OLLAMA_URL})
+        --text            Print the narration to stdout; no synthesis or audio
+    -h, --help            Print this help and exit
+    -V, --version         Print the version and exit
+
+TUI CONTROLS:
+    space  pause/resume      ←/→  seek prev/next      −/+  speed
+    ↑/↓    scroll            f    follow audio         q   quit
+
+NOTES:
+    AI narration needs a local Ollama (https://ollama.com); without it a
+    deterministic offline humanizer is used. The neural voice (~64 MB) is
+    downloaded and verified on first run, then everything is fully offline.
+
+ENVIRONMENT:
+    TECH_READER_MODEL, TECH_READER_OLLAMA   defaults for --model / --ollama
+    TECH_READER_VOICE_DIR                   use an already-extracted voice dir
+    TECH_READER_CACHE_MB                    PCM cache budget (default {DEFAULT_CACHE_MB})",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 /// Initial speed multiplier from `TECH_READER_SPEED` (default 1.0), clamped to a
@@ -304,20 +338,11 @@ fn run() -> std::result::Result<(), AppError> {
         return Ok(());
     }
 
-    let vdir = voice_dir();
-    let model = vdir.join("en_US-amy-low.onnx");
-    let tokens = vdir.join("tokens.txt");
-    let data_dir = vdir.join("espeak-ng-data");
-    if !model.exists() {
-        return Err(AppError::new(
-            exit::VOICE,
-            anyhow!(
-                "voice model not found at {} — download the amy-low voice first \
-                 (or set TECH_READER_VOICE_DIR)",
-                model.display()
-            ),
-        ));
-    }
+    // Resolve the voice, downloading + verifying it on first run (§9.2 / §5.4).
+    let voice = voices::ensure_default().map_err(|e| AppError::new(exit::VOICE, e))?;
+    let model = voice.model;
+    let tokens = voice.tokens;
+    let data_dir = voice.data_dir;
 
     let cap_bytes = cache_cap_bytes();
     let fail_set = parse_fail_set();
