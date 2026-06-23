@@ -12,19 +12,14 @@
 class TechReader < Formula
   desc "Reads code, comments, and specs aloud-but-explained (local Ollama + neural TTS)"
   homepage "https://github.com/brianberlin/tech-reader"
+  url "https://github.com/brianberlin/tech-reader/releases/download/v0.1.0/tech-reader-0.1.0-arm64-darwin.tar.gz"
+  sha256 "20538508fc3492203095f5f21943b833cb38603bf8985b1b9cd0f933134cbd84"
   version "0.1.0"
   license "MIT"
 
-  on_macos do
-    on_arm do
-      url "https://github.com/brianberlin/tech-reader/releases/download/v0.1.0/tech-reader-0.1.0-arm64-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # filled by CI
-    end
-    on_intel do
-      url "https://github.com/brianberlin/tech-reader/releases/download/v0.1.0/tech-reader-0.1.0-x86_64-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # filled by CI
-    end
-  end
+  # macOS Apple Silicon is the supported target (N5). Intel (x86_64) is a
+  # best-effort future addition and is not yet built/published.
+  depends_on arch: :arm64
 
   # Ollama is a separate local daemon the user installs (never bundled, §9.3) and
   # is optional — without it tech-reader uses the offline humanizer — so it is not

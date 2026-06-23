@@ -25,13 +25,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # macOS Apple Silicon is the supported target (N5). Intel (x86_64,
+        # macos-13) is a best-effort future addition — add it back to the matrix
+        # when wanted; it queues much longer on GitHub's Intel runners.
         include:
           - target: aarch64-apple-darwin
             arch: arm64-darwin
             runner: macos-14 # Apple Silicon
-          - target: x86_64-apple-darwin
-            arch: x86_64-darwin
-            runner: macos-13 # Intel (best-effort, N5)
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
