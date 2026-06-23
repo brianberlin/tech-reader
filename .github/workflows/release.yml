@@ -57,11 +57,14 @@ jobs:
       - name: Build (release, static onnxruntime)
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Record onnxruntime archive sha256 (pin reference)
+      - name: Record onnxruntime archive sha256 (pin reference, best-effort)
         run: |
           mkdir -p build
-          find ~ -iname '*onnxruntime*osx*' \( -name '*.tgz' -o -name '*.tar.*' -o -name '*.zip' \) \
-            -exec shasum -a 256 {} \; | tee build/onnxruntime-${{ matrix.arch }}.sha256 || true
+          find ~ "$HOME/.cache" -iname '*onnxruntime*' \( -name '*.tgz' -o -name '*.tar.*' -o -name '*.zip' \) \
+            -exec shasum -a 256 {} \; 2>/dev/null | tee "build/onnxruntime-${{ matrix.arch }}.sha256" || true
+          # Drop the file if it came up empty (the sys crate may consume the
+          # archive in place) — GitHub rejects a 0-byte release asset.
+          [ -s "build/onnxruntime-${{ matrix.arch }}.sha256" ] || rm -f "build/onnxruntime-${{ matrix.arch }}.sha256"
 
       - name: Package tarball
         id: pkg
@@ -91,6 +94,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: |
-            ${{ steps.pkg.outputs.tarball }}
-            build/onnxruntime-${{ matrix.arch }}.sha256
+          files: ${{ steps.pkg.outputs.tarball }}
