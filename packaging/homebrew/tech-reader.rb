@@ -5,23 +5,23 @@
 # one self-contained Mach-O per arch, uploads it as a release asset, and records
 # its sha256 below.
 #
-# Distribute via a tap (e.g. `brew tap nberl-in/tech-reader && brew install
+# Distribute via a tap (e.g. `brew tap brianberlin/tech-reader && brew install
 # tech-reader`). Binaries delivered through a formula carry no com.apple.quarantine,
 # so the ad-hoc-signed binary runs without a Gatekeeper prompt and needs no paid
 # Developer ID or notarization (§9.4). Ship a FORMULA, never a cask.
 class TechReader < Formula
   desc "Reads code, comments, and specs aloud-but-explained (local Ollama + neural TTS)"
-  homepage "https://github.com/nberl-in/tech-reader"
+  homepage "https://github.com/brianberlin/tech-reader"
   version "0.1.0"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/nberl-in/tech-reader/releases/download/v0.1.0/tech-reader-0.1.0-arm64-darwin.tar.gz"
+      url "https://github.com/brianberlin/tech-reader/releases/download/v0.1.0/tech-reader-0.1.0-arm64-darwin.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000" # filled by CI
     end
     on_intel do
-      url "https://github.com/nberl-in/tech-reader/releases/download/v0.1.0/tech-reader-0.1.0-x86_64-darwin.tar.gz"
+      url "https://github.com/brianberlin/tech-reader/releases/download/v0.1.0/tech-reader-0.1.0-x86_64-darwin.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000" # filled by CI
     end
   end

@@ -3,12 +3,12 @@
 # binary for this Mac and installs it. No compile, no onnxruntime download, no
 # Node. The neural voice is fetched + verified on first run.
 #
-#   curl -fsSL https://raw.githubusercontent.com/nberl-in/tech-reader/main/packaging/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/brianberlin/tech-reader/main/packaging/install.sh | sh
 #
 # Override the version with TECH_READER_VERSION, the install dir with PREFIX.
 set -eu
 
-REPO="nberl-in/tech-reader"
+REPO="brianberlin/tech-reader"
 VERSION="${TECH_READER_VERSION:-latest}"
 PREFIX="${PREFIX:-/usr/local/bin}"
 

@@ -18,10 +18,10 @@ no cloud TTS, no telemetry.
 
 ```sh
 # Homebrew (prebuilt, no compile)
-brew tap nberl-in/tech-reader && brew install tech-reader
+brew tap brianberlin/tech-reader && brew install tech-reader
 
 # or curl | sh
-curl -fsSL https://raw.githubusercontent.com/nberl-in/tech-reader/main/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/brianberlin/tech-reader/main/packaging/install.sh | sh
 ```
 
 Both deliver one self-contained binary (onnxruntime static-linked); the neural

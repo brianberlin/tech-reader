@@ -39,7 +39,7 @@ machine (that would re-download the onnxruntime archive per user).
 1. **Homebrew formula** (`packaging/homebrew/tech-reader.rb`) — a binary formula
    in a tap:
    ```sh
-   brew tap nberl-in/tech-reader && brew install tech-reader
+   brew tap brianberlin/tech-reader && brew install tech-reader
    ```
    Ship a **formula, not a cask**: formula/curl/tar delivery carries no
    `com.apple.quarantine`, so the unsigned binary runs without a prompt. Casks
