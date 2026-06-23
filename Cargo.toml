@@ -2,7 +2,7 @@
 name = "tech-reader"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Reads source code, comments, and specs aloud-but-explained: local Ollama narration + local neural TTS + a gapless TUI reader."
 license = "MIT"
 

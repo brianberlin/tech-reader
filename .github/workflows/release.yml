@@ -36,10 +36,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (pinned)
+      - name: Install Rust (pinned to the MSRV)
         run: |
-          rustup toolchain install 1.85 --profile minimal
-          rustup default 1.85
+          rustup toolchain install 1.88 --profile minimal
+          rustup default 1.88
           rustup target add ${{ matrix.target }}
 
       # Cache the onnxruntime archive sherpa-onnx-sys downloads, keyed by the
