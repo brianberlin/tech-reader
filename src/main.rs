@@ -39,6 +39,7 @@ use narrate::{stream_narration, Emitter, NarrationSettings};
 use ollama::OllamaConfig;
 use transport::Transport;
 use tts::{SynthPcm, Synthesizer};
+use types::Sentence;
 
 /// Narrated when no file is given.
 const WELCOME_MD: &str = "\
@@ -203,7 +204,8 @@ OPTIONS:
 
 TUI CONTROLS:
     space  pause/resume      ←/→  seek prev/next      −/+  speed
-    ↑/↓    scroll            f    follow audio         q   quit
+    ↑/↓    select section    ⏎    jump to selection    f    follow audio
+    Tab    prose / source    w    wrap (source view)   q    quit
 
 NOTES:
     AI narration needs a local Ollama (https://ollama.com); without it a
@@ -286,6 +288,16 @@ fn run() -> std::result::Result<(), AppError> {
         eprintln!("Nothing readable to narrate.");
         return Ok(());
     }
+
+    // The original document, split into display lines for the TUI's source view.
+    // Normalize line endings *exactly* as `segment_blocks` does so each block's
+    // 1-based line range indexes the right rows here.
+    let source_lines: Arc<[String]> = source
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(String::from)
+        .collect();
     crate::diag!(
         "[narrate] {} ({}) -> {} blocks",
         label,
@@ -300,7 +312,7 @@ fn run() -> std::result::Result<(), AppError> {
     // random-access seek) and the TUI renders. `cancel` lets a TUI quit stop the
     // narrator promptly and the synth worker leave FFI before teardown.
     // `narrator_done` / `synth_idle` are completion signals.
-    let sentences: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sentences: Arc<Mutex<Vec<Sentence>>> = Arc::new(Mutex::new(Vec::new()));
     let cancel = Arc::new(AtomicBool::new(false));
     let narrator_done = Arc::new(AtomicBool::new(false));
     let synth_idle = Arc::new(AtomicBool::new(false));
@@ -414,7 +426,7 @@ fn run() -> std::result::Result<(), AppError> {
                 }
                 synth_idle.store(false, Ordering::Relaxed);
 
-                let text = sentences.lock().unwrap()[cursor].clone();
+                let text = sentences.lock().unwrap()[cursor].text.clone();
                 let pcm = match synth_one(
                     &engine, &mut cache, &fail_set, cursor, &text, rate, active_speed, g,
                     &mut consecutive,
@@ -443,6 +455,7 @@ fn run() -> std::result::Result<(), AppError> {
     if interactive {
         let res = tui::run(
             Arc::clone(&sentences),
+            Arc::clone(&source_lines),
             &spine,
             Arc::clone(&transport),
             Arc::clone(&synth_idle),
@@ -477,12 +490,12 @@ fn run() -> std::result::Result<(), AppError> {
 }
 
 /// `--text` mode: print sentences to stdout as the narrator produces them.
-fn print_narrated(sentences: &Mutex<Vec<String>>, narrator_done: &AtomicBool) {
+fn print_narrated(sentences: &Mutex<Vec<Sentence>>, narrator_done: &AtomicBool) {
     let mut printed = 0usize;
     loop {
         let len = sentences.lock().unwrap().len();
         while printed < len {
-            let t = sentences.lock().unwrap()[printed].clone();
+            let t = sentences.lock().unwrap()[printed].text.clone();
             println!("{printed:>3}  {t}");
             printed += 1;
         }

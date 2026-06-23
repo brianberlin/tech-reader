@@ -30,15 +30,14 @@ pub struct Block {
     pub lang: String,
 }
 
-/// One narration sentence — the spoken (and, later, displayed) text plus a
-/// best-effort source mapping back to the block it came from.
+/// One narration sentence — the spoken (and displayed) text, plus the 1-based
+/// source line range of the block it came from so the TUI can highlight the
+/// original document region while this sentence is read.
 #[derive(Debug, Clone)]
 pub struct Sentence {
-    pub idx: usize,
     /// The already-humanized / explained text to speak and show.
     pub text: String,
-    pub kind: BlockKind,
+    /// 1-based inclusive source line range of the originating block.
     pub start_line: usize,
     pub end_line: usize,
-    pub block_index: usize,
 }

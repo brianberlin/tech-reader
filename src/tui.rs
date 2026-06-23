@@ -21,7 +21,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -29,6 +29,7 @@ use ratatui::{Frame, Terminal};
 
 use crate::audio::Spine;
 use crate::transport::Transport;
+use crate::types::Sentence;
 
 type Backend = CrosstermBackend<Stdout>;
 
@@ -45,27 +46,69 @@ struct Status {
     underruns: u64,
 }
 
-/// Scroll/follow/speed state owned by the loop (not shared).
+/// Which view fills the body: the spoken prose, or the original source with the
+/// narrated region highlighted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Prose,
+    Source,
+}
+
+impl Pane {
+    fn toggle(self) -> Pane {
+        match self {
+            Pane::Prose => Pane::Source,
+            Pane::Source => Pane::Prose,
+        }
+    }
+}
+
+/// Scroll/follow/speed/view state owned by the loop (not shared).
 struct View {
     /// When true, the highlight follows the audible sentence and auto-scrolls.
     follow: bool,
     /// The highlighted row: the audible sentence while following, else the
-    /// browse cursor.
+    /// browse cursor. Always a *sentence* index, in both panes — so ↑/↓ and
+    /// Enter-to-seek behave identically whichever view is shown.
     selected: usize,
     /// Index into `SPEED_LADDER`.
     speed_step: usize,
+    /// Which body view is shown.
+    pane: Pane,
+    /// In the source view, whether long lines wrap (else they are truncated).
+    wrap_source: bool,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            follow: true,
+            selected: 0,
+            speed_step: DEFAULT_SPEED_STEP,
+            pane: Pane::Prose,
+            wrap_source: true,
+        }
+    }
 }
 
 /// Run the TUI until the user quits (or the audio device dies). Restores the
 /// terminal before returning, even on error, so later stderr is not swallowed.
 pub fn run(
-    sentences: Arc<Mutex<Vec<String>>>,
+    sentences: Arc<Mutex<Vec<Sentence>>>,
+    source_lines: Arc<[String]>,
     spine: &Spine,
     transport: Arc<Transport>,
     synth_idle: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let mut terminal = setup()?;
-    let res = event_loop(&mut terminal, &sentences, spine, &transport, &synth_idle);
+    let res = event_loop(
+        &mut terminal,
+        &sentences,
+        &source_lines,
+        spine,
+        &transport,
+        &synth_idle,
+    );
     restore(&mut terminal);
     res
 }
@@ -93,16 +136,13 @@ fn restore(terminal: &mut Terminal<Backend>) {
 
 fn event_loop(
     terminal: &mut Terminal<Backend>,
-    sentences: &Arc<Mutex<Vec<String>>>,
+    sentences: &Arc<Mutex<Vec<Sentence>>>,
+    source_lines: &[String],
     spine: &Spine,
     transport: &Transport,
     synth_idle: &AtomicBool,
 ) -> io::Result<()> {
-    let mut view = View {
-        follow: true,
-        selected: 0,
-        speed_step: DEFAULT_SPEED_STEP,
-    };
+    let mut view = View::default();
 
     loop {
         // Resolve the audible sentence first (locks the boundary table only), so
@@ -128,7 +168,7 @@ fn event_loop(
             if !sents.is_empty() {
                 view.selected = view.selected.min(sents.len() - 1);
             }
-            terminal.draw(|f| ui(f, &sents, current, &view, &status))?;
+            terminal.draw(|f| ui(f, &sents, source_lines, current, &view, &status))?;
         }
 
         // A dead device means the highlight can never advance — leave.
@@ -230,12 +270,21 @@ fn handle_key(key: KeyEvent, view: &mut View, total: usize) -> bool {
             view.selected = last;
         }
         KeyCode::Char('f') => view.follow = true,
+        KeyCode::Tab => view.pane = view.pane.toggle(),
+        KeyCode::Char('w') => view.wrap_source = !view.wrap_source,
         _ => {}
     }
     false
 }
 
-fn ui(frame: &mut Frame, sentences: &[String], current: Option<usize>, view: &View, status: &Status) {
+fn ui(
+    frame: &mut Frame,
+    sentences: &[Sentence],
+    source_lines: &[String],
+    current: Option<usize>,
+    view: &View,
+    status: &Status,
+) {
     let rows = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Min(0),    // narration
@@ -243,62 +292,177 @@ fn ui(frame: &mut Frame, sentences: &[String], current: Option<usize>, view: &Vi
     ])
     .split(frame.area());
 
-    frame.render_widget(header(sentences.len(), current, view.follow, status), rows[0]);
+    frame.render_widget(header(sentences.len(), current, view, status), rows[0]);
 
-    if sentences.is_empty() {
-        let waiting = Paragraph::new("Starting narration…").style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(waiting, rows[1]);
-    } else {
-        // Wrap each sentence to the available width; the active cursor row is
-        // auto-scrolled into view by ListState.
-        let width = rows[1].width.saturating_sub(2).max(1) as usize;
-        // The playhead (what's audible right now) is always painted, so the
-        // reading position stays visible even while the user browses elsewhere.
-        let playhead = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
-        let items: Vec<ListItem> = sentences
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let base = if current == Some(i) {
-                    playhead
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                let lines: Vec<Line> = wrap(s, width)
-                    .into_iter()
-                    .map(|l| Line::from(Span::styled(l, base)))
-                    .collect();
-                ListItem::new(Text::from(lines))
-            })
-            .collect();
-
-        // The active cursor (the row ListState scrolls to and marks). While
-        // following it *is* the playhead; while browsing it's the pending jump
-        // target — shown in a distinct colour and symbol so it reads as a
-        // selection to commit with Enter, not the reading position.
-        let (cursor_style, cursor_symbol) = if view.follow {
-            (playhead, "▸ ")
-        } else {
-            (
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
-                "» ",
-            )
-        };
-
-        let list = List::new(items)
-            .highlight_style(cursor_style)
-            .highlight_symbol(cursor_symbol)
-            .scroll_padding(2);
-
-        let mut state = ListState::default();
-        state.select(Some(view.selected));
-        frame.render_stateful_widget(list, rows[1], &mut state);
+    match view.pane {
+        Pane::Prose => render_prose(frame, rows[1], sentences, current, view),
+        Pane::Source => render_source(frame, rows[1], source_lines, sentences, current, view),
     }
 
-    frame.render_widget(footer(view.follow), rows[2]);
+    frame.render_widget(footer(view), rows[2]);
 }
 
-fn header(total: usize, current: Option<usize>, follow: bool, status: &Status) -> Paragraph<'static> {
+/// The style of the playhead block (what is audible right now) — a solid cyan bar.
+fn playhead_style() -> Style {
+    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+}
+
+/// The style of the browse selection (the pending jump target) — solid yellow,
+/// deliberately distinct from the playhead.
+fn selection_style() -> Style {
+    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+}
+
+/// Prose view: the spoken sentences, the audible one highlighted (playhead) and
+/// the browse cursor shown distinctly while browsing.
+fn render_prose(
+    frame: &mut Frame,
+    area: Rect,
+    sentences: &[Sentence],
+    current: Option<usize>,
+    view: &View,
+) {
+    if sentences.is_empty() {
+        let waiting = Paragraph::new("Starting narration…").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(waiting, area);
+        return;
+    }
+    // Wrap each sentence to the available width; the active cursor row is
+    // auto-scrolled into view by ListState.
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    // The playhead (what's audible right now) is always painted, so the reading
+    // position stays visible even while the user browses elsewhere.
+    let playhead = playhead_style();
+    let items: Vec<ListItem> = sentences
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let base = if current == Some(i) {
+                playhead
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let lines: Vec<Line> = wrap(&s.text, width)
+                .into_iter()
+                .map(|l| Line::from(Span::styled(l, base)))
+                .collect();
+            ListItem::new(Text::from(lines))
+        })
+        .collect();
+
+    // The active cursor (the row ListState scrolls to and marks). While
+    // following it *is* the playhead; while browsing it's the pending jump
+    // target — shown in a distinct colour and symbol so it reads as a
+    // selection to commit with Enter, not the reading position.
+    let (cursor_style, cursor_symbol) = if view.follow {
+        (playhead, "▸ ")
+    } else {
+        (selection_style(), "» ")
+    };
+
+    let list = List::new(items)
+        .highlight_style(cursor_style)
+        .highlight_symbol(cursor_symbol)
+        .scroll_padding(2);
+
+    let mut state = ListState::default();
+    state.select(Some(view.selected));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Source view: the original document with the narrated region highlighted. The
+/// playhead's block is painted cyan; while browsing, the selected sentence's
+/// block is painted yellow. ListState is used only to scroll the active block
+/// into view — the highlight itself is per-line styling (a block spans many
+/// rows, which `highlight_style` cannot express).
+fn render_source(
+    frame: &mut Frame,
+    area: Rect,
+    source_lines: &[String],
+    sentences: &[Sentence],
+    current: Option<usize>,
+    view: &View,
+) {
+    if source_lines.is_empty() {
+        return;
+    }
+    // 1-based inclusive source-line range of the block a sentence came from.
+    let range_of = |i: usize| -> Option<(usize, usize)> {
+        sentences.get(i).map(|s| (s.start_line, s.end_line))
+    };
+    let playhead_range = current.and_then(&range_of);
+    let browse_range = (!view.follow).then(|| range_of(view.selected)).flatten();
+
+    let total = source_lines.len();
+    let gutter_digits = total.to_string().len();
+    // Gutter is "<n> │ ": digits + space + bar + space.
+    let gutter_w = gutter_digits + 3;
+    let content_w = (area.width as usize).saturating_sub(gutter_w).max(1);
+
+    let playhead = playhead_style();
+    let selection = selection_style();
+    let gutter_style = Style::default().fg(Color::DarkGray);
+    let contains = |range: Option<(usize, usize)>, line_no: usize| {
+        matches!(range, Some((lo, hi)) if line_no >= lo && line_no <= hi)
+    };
+
+    let items: Vec<ListItem> = source_lines
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let line_no = i + 1; // 1-based, to match block ranges
+            // Browse selection wins over the playhead on overlap, matching prose.
+            let base = if contains(browse_range, line_no) {
+                selection
+            } else if contains(playhead_range, line_no) {
+                playhead
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let highlighted = contains(browse_range, line_no) || contains(playhead_range, line_no);
+
+            let rows: Vec<String> = if view.wrap_source {
+                wrap(text, content_w)
+            } else {
+                vec![text.chars().take(content_w).collect()]
+            };
+            let lines: Vec<Line> = rows
+                .into_iter()
+                .enumerate()
+                .map(|(ri, mut row)| {
+                    // Fill highlighted rows to the content width so the block
+                    // reads as a solid bar rather than ragged-right.
+                    if highlighted {
+                        let pad = content_w.saturating_sub(row.chars().count());
+                        row.extend(std::iter::repeat_n(' ', pad));
+                    }
+                    let gutter = if ri == 0 {
+                        format!("{line_no:>gutter_digits$} │ ")
+                    } else {
+                        format!("{:gutter_digits$} │ ", "")
+                    };
+                    Line::from(vec![Span::styled(gutter, gutter_style), Span::styled(row, base)])
+                })
+                .collect();
+            ListItem::new(Text::from(lines))
+        })
+        .collect();
+
+    // Scroll the first line of the active block into view (no highlight styling
+    // here — appearance is entirely per-line above).
+    let anchor = if view.follow { playhead_range } else { browse_range }
+        .map(|(lo, _)| lo)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .min(total - 1);
+
+    let list = List::new(items).scroll_padding(2);
+    let mut state = ListState::default();
+    state.select(Some(anchor));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn header(total: usize, current: Option<usize>, view: &View, status: &Status) -> Paragraph<'static> {
     let pos = current.map(|c| c + 1).unwrap_or(0);
     let state = if status.paused {
         Span::styled("⏸ paused", Style::default().fg(Color::Yellow))
@@ -317,7 +481,14 @@ fn header(total: usize, current: Option<usize>, follow: bool, status: &Status) -
             Style::default().fg(Color::Gray),
         ),
         Span::styled(
-            if follow { "   ⟳ follow" } else { "   ‖ browsing" },
+            match view.pane {
+                Pane::Prose => "   ¶ prose",
+                Pane::Source => "   </> source",
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if view.follow { "   ⟳ follow" } else { "   ‖ browsing" },
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -337,12 +508,19 @@ fn fmt_speed(speed: f32) -> String {
     format!("{s}×")
 }
 
-fn footer(follow: bool) -> Paragraph<'static> {
-    let hint = if follow {
-        "space pause · ←/→ seek · −/+ speed · ↑/↓ select · q quit"
-    } else {
-        "↑/↓ select · ⏎ jump · f follow · space pause · ←/→ seek · −/+ speed · q quit"
-    };
+fn footer(view: &View) -> Paragraph<'static> {
+    let mut parts: Vec<&str> = Vec::new();
+    if !view.follow {
+        parts.push("⏎ jump");
+        parts.push("f follow");
+    }
+    parts.push("↑/↓ select");
+    parts.push("Tab view");
+    if matches!(view.pane, Pane::Source) {
+        parts.push("w wrap");
+    }
+    parts.extend(["space pause", "←/→ seek", "−/+ speed", "q quit"]);
+    let hint = parts.join(" · ");
     Paragraph::new(Line::from(Span::styled(
         hint,
         Style::default().fg(Color::DarkGray),
@@ -387,23 +565,39 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
-    fn render(sentences: &[String], current: Option<usize>, follow: bool) -> ratatui::buffer::Buffer {
-        render_status(sentences, current, follow, false)
+    /// A sentence carrying an explicit source-line range.
+    fn sent(text: &str, start_line: usize, end_line: usize) -> Sentence {
+        Sentence {
+            text: text.to_string(),
+            start_line,
+            end_line,
+        }
     }
 
-    fn render_status(
-        sentences: &[String],
+    /// Prose sentences with throwaway 1-line ranges (the prose pane ignores them).
+    fn prose(texts: &[&str]) -> Vec<Sentence> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| sent(t, i + 1, i + 1))
+            .collect()
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Render one frame to a test buffer with the given panes/state.
+    fn draw(
+        sentences: &[Sentence],
+        source_lines: &[String],
         current: Option<usize>,
-        follow: bool,
+        view: &View,
         paused: bool,
-    ) -> ratatui::buffer::Buffer {
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        let view = View {
-            follow,
-            selected: current.unwrap_or(0),
-            speed_step: DEFAULT_SPEED_STEP,
-        };
         let status = Status {
             paused,
             finished: false,
@@ -411,29 +605,33 @@ mod tests {
             underruns: 0,
         };
         terminal
-            .draw(|f| ui(f, sentences, current, &view, &status))
+            .draw(|f| ui(f, sentences, source_lines, current, view, &status))
             .unwrap();
         terminal.backend().buffer().clone()
     }
 
-    /// Render with an explicit `View`, so a test can set a browse cursor
-    /// (`selected`) independent of the audible `current`.
-    fn render_view(
-        sentences: &[String],
+    fn render(sentences: &[Sentence], current: Option<usize>, follow: bool) -> Buffer {
+        render_status(sentences, current, follow, false)
+    }
+
+    fn render_status(
+        sentences: &[Sentence],
         current: Option<usize>,
-        view: &View,
-    ) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        let status = Status {
-            paused: false,
-            finished: false,
-            speed: SPEED_LADDER[DEFAULT_SPEED_STEP],
-            underruns: 0,
+        follow: bool,
+        paused: bool,
+    ) -> Buffer {
+        let view = View {
+            follow,
+            selected: current.unwrap_or(0),
+            ..View::default()
         };
-        terminal
-            .draw(|f| ui(f, sentences, current, view, &status))
-            .unwrap();
-        terminal.backend().buffer().clone()
+        draw(sentences, &[], current, &view, paused)
+    }
+
+    /// Render the prose pane with an explicit `View`, so a test can set a browse
+    /// cursor (`selected`) independent of the audible `current`.
+    fn render_view(sentences: &[Sentence], current: Option<usize>, view: &View) -> Buffer {
+        draw(sentences, &[], current, view, false)
     }
 
     /// The background colour of the first highlighted cell on the row holding
@@ -470,11 +668,11 @@ mod tests {
 
     #[test]
     fn renders_sentences_and_position() {
-        let s = vec![
-            "First sentence here.".to_string(),
-            "Second sentence here.".to_string(),
-            "Third sentence here.".to_string(),
-        ];
+        let s = prose(&[
+            "First sentence here.",
+            "Second sentence here.",
+            "Third sentence here.",
+        ]);
         let text = buffer_text(&render(&s, Some(1), true));
         assert!(text.contains("First sentence"), "{text}");
         assert!(text.contains("Second sentence"), "{text}");
@@ -485,7 +683,7 @@ mod tests {
 
     #[test]
     fn current_sentence_is_highlighted() {
-        let s = vec!["Alpha line.".to_string(), "Beta line.".to_string()];
+        let s = prose(&["Alpha line.", "Beta line."]);
         let buf = render(&s, Some(1), true);
         // Find the row containing "Beta" and confirm it carries the cyan
         // highlight background (the current-sentence style).
@@ -509,7 +707,7 @@ mod tests {
 
     #[test]
     fn paused_state_in_header() {
-        let s = vec!["Alpha.".to_string()];
+        let s = prose(&["Alpha."]);
         let playing = buffer_text(&render_status(&s, Some(0), true, false));
         assert!(playing.contains("reading"), "{playing}");
         let paused = buffer_text(&render_status(&s, Some(0), true, true));
@@ -527,11 +725,7 @@ mod tests {
     #[test]
     fn speed_steps_clamp_and_publish() {
         let t = Transport::new(1.0);
-        let mut v = View {
-            follow: true,
-            selected: 0,
-            speed_step: DEFAULT_SPEED_STEP,
-        };
+        let mut v = View::default();
         change_speed(&t, &mut v, 3, 1); // 1.0× -> 1.25×, resuming at sentence 3
         assert_eq!(v.speed_step, 2);
         assert_eq!(t.speed(), 1.25);
@@ -554,7 +748,7 @@ mod tests {
         let mut v = View {
             follow: false,
             selected: 9,
-            speed_step: DEFAULT_SPEED_STEP,
+            ..View::default()
         };
         seek(&t, &mut v, 4);
         assert_eq!(v.selected, 4);
@@ -566,15 +760,11 @@ mod tests {
     #[test]
     fn browsing_marks_selection_distinct_from_playhead() {
         // Audible at sentence 0 (playhead), browse cursor parked on sentence 2.
-        let s = vec![
-            "Alpha line.".to_string(),
-            "Beta line.".to_string(),
-            "Gamma line.".to_string(),
-        ];
+        let s = prose(&["Alpha line.", "Beta line.", "Gamma line."]);
         let view = View {
             follow: false,
             selected: 2,
-            speed_step: DEFAULT_SPEED_STEP,
+            ..View::default()
         };
         let buf = render_view(&s, Some(0), &view);
         // The playhead stays visible (cyan) even though the cursor is elsewhere,
@@ -595,11 +785,11 @@ mod tests {
     #[test]
     fn following_cursor_is_the_playhead() {
         // While following there is no separate selection: the cursor is cyan.
-        let s = vec!["Alpha line.".to_string(), "Beta line.".to_string()];
+        let s = prose(&["Alpha line.", "Beta line."]);
         let view = View {
             follow: true,
             selected: 1,
-            speed_step: DEFAULT_SPEED_STEP,
+            ..View::default()
         };
         let buf = render_view(&s, Some(1), &view);
         assert_eq!(row_highlight_bg(&buf, "Beta"), Some(Color::Cyan));
@@ -615,7 +805,7 @@ mod tests {
         let mut v = View {
             follow: false,
             selected: 7,
-            speed_step: DEFAULT_SPEED_STEP,
+            ..View::default()
         };
         commit_selection(&t, &mut v);
         assert_eq!(t.seek_target(), 7, "Enter jumps the playhead to the selection");
@@ -629,9 +819,88 @@ mod tests {
         let mut v = View {
             follow: true,
             selected: 3,
-            speed_step: DEFAULT_SPEED_STEP,
+            ..View::default()
         };
         commit_selection(&t, &mut v);
         assert_eq!(t.generation(), 0, "no seek is published when there is no pending selection");
+    }
+
+    fn lines(text: &[&str]) -> Vec<String> {
+        text.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn source_pane_highlights_block_range() {
+        // Sentence 0 maps to a block spanning source lines 2..=3.
+        let src = lines(&["one", "two", "three", "four", "five"]);
+        let s = vec![sent("spoken text", 2, 3)];
+        let view = View {
+            pane: Pane::Source,
+            ..View::default()
+        };
+        let buf = draw(&s, &src, Some(0), &view, false);
+        // The whole block (lines two & three) is cyan; lines outside it are not.
+        assert_eq!(row_highlight_bg(&buf, "two"), Some(Color::Cyan));
+        assert_eq!(row_highlight_bg(&buf, "three"), Some(Color::Cyan));
+        assert_eq!(row_highlight_bg(&buf, "one"), None);
+        assert_eq!(row_highlight_bg(&buf, "four"), None);
+    }
+
+    #[test]
+    fn source_pane_browse_selection_distinct_from_playhead() {
+        // Playhead on the sentence mapped to line 1; browse cursor on line 3.
+        let src = lines(&["aaa", "bbb", "ccc", "ddd"]);
+        let s = vec![sent("first", 1, 1), sent("second", 3, 3)];
+        let view = View {
+            pane: Pane::Source,
+            follow: false,
+            selected: 1,
+            ..View::default()
+        };
+        let buf = draw(&s, &src, Some(0), &view, false);
+        assert_eq!(
+            row_highlight_bg(&buf, "aaa"),
+            Some(Color::Cyan),
+            "playhead line stays cyan while browsing the source"
+        );
+        assert_eq!(
+            row_highlight_bg(&buf, "ccc"),
+            Some(Color::Yellow),
+            "browse selection in the source reads as a distinct colour"
+        );
+    }
+
+    #[test]
+    fn source_pane_shows_line_numbers() {
+        let src = lines(&["alpha", "beta"]);
+        let s = vec![sent("x", 1, 1)];
+        let view = View {
+            pane: Pane::Source,
+            ..View::default()
+        };
+        let text = buffer_text(&draw(&s, &src, None, &view, false));
+        // The gutter numbers the source lines.
+        assert!(text.contains("1 │ alpha"), "{text}");
+        assert!(text.contains("2 │ beta"), "{text}");
+    }
+
+    #[test]
+    fn tab_toggles_pane() {
+        let mut v = View::default();
+        assert!(matches!(v.pane, Pane::Prose));
+        assert!(!handle_key(key(KeyCode::Tab), &mut v, 1));
+        assert!(matches!(v.pane, Pane::Source));
+        handle_key(key(KeyCode::Tab), &mut v, 1);
+        assert!(matches!(v.pane, Pane::Prose));
+    }
+
+    #[test]
+    fn w_toggles_source_wrap() {
+        let mut v = View::default();
+        assert!(v.wrap_source, "wrapping is on by default");
+        handle_key(key(KeyCode::Char('w')), &mut v, 1);
+        assert!(!v.wrap_source);
+        handle_key(key(KeyCode::Char('w')), &mut v, 1);
+        assert!(v.wrap_source);
     }
 }

@@ -17,21 +17,27 @@ use crate::types::{Block, BlockKind, Sentence};
 /// the synth worker reads by index (enabling random-access seek), and reports
 /// cancellation so narration stops promptly on quit.
 pub struct Emitter {
-    sentences: Arc<Mutex<Vec<String>>>,
+    sentences: Arc<Mutex<Vec<Sentence>>>,
     cancel: Arc<AtomicBool>,
 }
 
 impl Emitter {
-    pub fn new(sentences: Arc<Mutex<Vec<String>>>, cancel: Arc<AtomicBool>) -> Self {
+    pub fn new(sentences: Arc<Mutex<Vec<Sentence>>>, cancel: Arc<AtomicBool>) -> Self {
         Self { sentences, cancel }
     }
 
-    /// Append a sentence. Returns false if narration should stop (cancelled).
-    pub fn emit(&self, text: String) -> bool {
+    /// Append a sentence, tagged with the source line range of the `block` it
+    /// came from so the TUI can map it back to the original document. Returns
+    /// false if narration should stop (cancelled).
+    pub fn emit(&self, text: String, block: &Block) -> bool {
         if self.cancel.load(Relaxed) {
             return false;
         }
-        self.sentences.lock().unwrap().push(text);
+        self.sentences.lock().unwrap().push(Sentence {
+            text,
+            start_line: block.start_line,
+            end_line: block.end_line,
+        });
         true
     }
 }
@@ -115,9 +121,8 @@ pub fn narrate_offline(
 ) -> Vec<Sentence> {
     let dict: HashMap<String, String> = HashMap::new();
     let mut out: Vec<Sentence> = Vec::new();
-    let mut idx = 0usize;
 
-    for (bi, block) in blocks.iter().enumerate() {
+    for block in blocks {
         let Some(text) = humanize_block_text(block, settings, &dict) else {
             continue;
         };
@@ -126,14 +131,10 @@ pub fn narrate_offline(
                 continue;
             }
             out.push(Sentence {
-                idx,
                 text: s,
-                kind: block.kind,
                 start_line: block.start_line,
                 end_line: block.end_line,
-                block_index: bi,
             });
-            idx += 1;
         }
     }
     out
@@ -277,7 +278,7 @@ async fn stream_block(
                 if s.trim().is_empty() {
                     continue;
                 }
-                if !emit.emit(s) {
+                if !emit.emit(s, block) {
                     stopped = true;
                     return;
                 }
@@ -296,7 +297,7 @@ async fn stream_block(
                 if s.trim().is_empty() {
                     continue;
                 }
-                if !emit.emit(s) {
+                if !emit.emit(s, block) {
                     return StreamOutcome::Stop;
                 }
                 emitted += 1;
@@ -328,7 +329,7 @@ fn send_humanized(
             if s.trim().is_empty() {
                 continue;
             }
-            if !emit.emit(s) {
+            if !emit.emit(s, block) {
                 return false;
             }
         }
