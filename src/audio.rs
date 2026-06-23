@@ -64,11 +64,17 @@ struct Shared {
     consumer_dead: AtomicBool,
     /// Set when the feeder has consumed its entire input.
     feeder_done: AtomicBool,
+    /// True while the feeder is parked on `recv` with nothing to push. Lets the
+    /// underrun monitor tell a genuine "feeder fell behind" from an expected gap
+    /// where synthesis/Ollama simply hasn't produced the next sentence yet.
+    feeder_waiting: AtomicBool,
 }
 
 pub struct Spine {
     stream: Option<cpal::Stream>,
-    feeder: Option<JoinHandle<Vec<f32>>>,
+    feeder: Option<JoinHandle<()>>,
+    /// Low-priority out-of-band underrun logger (live device only).
+    monitor: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
     device_rate: u32,
     channels: u16,
@@ -111,6 +117,7 @@ impl Spine {
             started: AtomicBool::new(false),
             consumer_dead: AtomicBool::new(false),
             feeder_done: AtomicBool::new(false),
+            feeder_waiting: AtomicBool::new(false),
         });
 
         let stream = match device_cfg {
@@ -131,12 +138,21 @@ impl Spine {
         };
 
         let feeder_shared = Arc::clone(&shared);
-        let feeder =
-            thread::spawn(move || feed(pcm_rx, producer, device_rate, channels, cfg, feeder_shared));
+        let feed_wav = wav_path.clone();
+        let feeder = thread::spawn(move || {
+            feed(pcm_rx, producer, device_rate, channels, cfg, feeder_shared, feed_wav)
+        });
+
+        // The out-of-band underrun monitor only makes sense with a live device
+        // draining the ring; in WAV-only mode the callback never runs.
+        let monitor = stream
+            .is_some()
+            .then(|| spawn_underrun_monitor(Arc::clone(&shared)));
 
         Ok(Spine {
             stream,
             feeder: Some(feeder),
+            monitor,
             shared,
             device_rate,
             channels,
@@ -217,17 +233,18 @@ impl Spine {
         }
     }
 
-    /// Stop the device, join the feeder, write the teed WAV, and return stats.
+    /// Stop the device and join the feeder (which has streamed and finalized the
+    /// teed WAV itself) and the monitor, then return stats.
     pub fn finish(mut self) -> Result<Report> {
         if let Some(stream) = self.stream.take() {
             drop(stream); // quiesce the callback first
         }
-        let wav_buf = match self.feeder.take() {
-            Some(h) => h.join().map_err(|_| anyhow!("feeder thread panicked"))?,
-            None => Vec::new(),
-        };
-        wav::write_i16_wav(&self.wav_path, &wav_buf, self.device_rate, self.channels)
-            .with_context(|| format!("failed to write {}", self.wav_path.display()))?;
+        if let Some(h) = self.feeder.take() {
+            h.join().map_err(|_| anyhow!("feeder thread panicked"))?;
+        }
+        if let Some(h) = self.monitor.take() {
+            let _ = h.join();
+        }
 
         let ch = self.channels.max(1) as u64;
         Ok(Report {
@@ -312,7 +329,7 @@ fn mark_no_device(shared: &Arc<Shared>) {
     shared.started.store(true, Relaxed);
 }
 
-/// Feeder thread body: PCM channel -> resample -> ring (+ WAV tee).
+/// Feeder thread body: PCM channel -> resample -> ring (+ streaming WAV tee).
 fn feed(
     pcm_rx: Receiver<SynthPcm>,
     mut producer: rtrb::Producer<f32>,
@@ -320,20 +337,36 @@ fn feed(
     channels: u16,
     cfg: SpineConfig,
     shared: Arc<Shared>,
-) -> Vec<f32> {
+    wav_path: PathBuf,
+) {
     let silence_frames = (device_rate as u64 * cfg.silence_ms as u64 / 1000) as usize;
     let ramp_frames = (device_rate as u64 * cfg.ramp_ms as u64 / 1000).max(1) as usize;
     let prebuffer_samples = device_rate as u64 * channels as u64 * cfg.prebuffer_ms as u64 / 1000;
     let mut started = false;
 
-    // Pre-reserve the WAV tee so a mid-stream Vec realloc never stalls the feeder
-    // (which would starve the ring and cause an underrun). Dev-only; production
-    // has no tee. Generous headroom; grows if exceeded.
-    let mut wav_buf: Vec<f32> = Vec::with_capacity(device_rate as usize * channels as usize * 90);
+    // Stream the WAV tee to disk as we go so memory stays bounded under a long
+    // document (N7). Dev-only; a failed open just drops the tee — never the run.
+    let mut wav = match wav::WavWriter::create(&wav_path, device_rate, channels) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!(
+                "[spine] could not open WAV tee at {} ({e}); continuing without it.",
+                wav_path.display()
+            );
+            None
+        }
+    };
 
     let trim_margin = (device_rate as usize * 10 / 1000).max(1); // ~10 ms keepout
 
-    while let Ok(pcm) = pcm_rx.recv() {
+    loop {
+        shared.feeder_waiting.store(true, Relaxed);
+        let pcm = match pcm_rx.recv() {
+            Ok(p) => p,
+            Err(_) => break, // all senders gone
+        };
+        shared.feeder_waiting.store(false, Relaxed);
+
         let resampled = resample_linear(&pcm.samples, pcm.sample_rate, device_rate);
         // Trim the voice's own leading/trailing near-silence so the only gap
         // between sentences is our exact, tunable inter-sentence silence (N1).
@@ -355,14 +388,62 @@ fn feed(
         }
         inter.resize(inter.len() + silence_frames * channels as usize, 0.0);
 
-        wav_buf.extend_from_slice(&inter);
+        if let Some(w) = wav.as_mut() {
+            if let Err(e) = w.write_frames(&inter) {
+                eprintln!("[spine] WAV tee write failed ({e}); dropping the tee.");
+                wav = None;
+            }
+        }
         push_slice(&mut producer, &inter, &shared, prebuffer_samples, &mut started);
     }
 
     // Short inputs may never reach the prebuffer target; ensure playback starts.
+    shared.feeder_waiting.store(false, Relaxed);
     shared.started.store(true, Relaxed);
     shared.feeder_done.store(true, Relaxed);
-    wav_buf
+
+    if let Some(w) = wav {
+        if let Err(e) = w.finalize() {
+            eprintln!("[spine] WAV tee finalize failed ({e}).");
+        }
+    }
+}
+
+/// Out-of-band underrun logger (§5.4). A low-priority thread that samples the
+/// underrun counter and, on **sustained** underruns *while the feeder has data
+/// to push*, logs a one-time hint. It deliberately stays quiet while the feeder
+/// is parked waiting on synthesis/Ollama, since raising buffers can't fix an
+/// upstream stall. Reads atomics only — never touches the ring.
+fn spawn_underrun_monitor(shared: Arc<Shared>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last = 0u64;
+        let mut bad_windows = 0u32;
+        let mut hinted = false;
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            if shared.feeder_done.load(Relaxed) || shared.consumer_dead.load(Relaxed) {
+                break;
+            }
+            if !shared.started.load(Relaxed) {
+                continue;
+            }
+            let now = shared.underruns.load(Relaxed);
+            let delta = now.saturating_sub(last);
+            last = now;
+            if delta > 0 && !shared.feeder_waiting.load(Relaxed) {
+                bad_windows += 1;
+                if bad_windows >= 3 && !hinted {
+                    eprintln!(
+                        "[spine] sustained audio underruns while feeding \
+                         — raise ring_ms or look-ahead depth."
+                    );
+                    hinted = true;
+                }
+            } else {
+                bad_windows = 0;
+            }
+        }
+    })
 }
 
 /// Bulk-push interleaved samples into the ring, blocking (back-pressure) when

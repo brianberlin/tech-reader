@@ -6,6 +6,7 @@
 //! single thread (the synth worker).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use sherpa_onnx::{
@@ -13,14 +14,40 @@ use sherpa_onnx::{
     OfflineTtsVitsModelConfig,
 };
 
-/// One synthesized sentence: owned mono f32 PCM at `sample_rate`.
+/// One synthesized sentence: mono f32 PCM at `sample_rate`.
+///
+/// The samples are shared via `Arc` so the PCM cache (§7.1.6) can keep a copy
+/// while the same buffer flows on to the feeder, with no deep copy on a cache
+/// hit and no deep copy to populate the cache.
 pub struct SynthPcm {
     /// Index of the sentence in the narration stream (for boundary tracking).
     pub sentence_index: usize,
     /// Mono PCM samples in `[-1.0, 1.0]`.
-    pub samples: Vec<f32>,
+    pub samples: Arc<[f32]>,
     /// The voice's native output sample rate (Hz). Never assume 22050.
     pub sample_rate: u32,
+}
+
+impl SynthPcm {
+    pub fn new(sentence_index: usize, samples: Arc<[f32]>, sample_rate: u32) -> Self {
+        Self {
+            sentence_index,
+            samples,
+            sample_rate,
+        }
+    }
+
+    /// A skipped/failed sentence: no samples. The feeder still inserts the
+    /// inter-sentence silence for it, so the sentence index stays aligned with
+    /// the audio downstream (§5.4 — "emits a short silence so the index stays
+    /// aligned").
+    pub fn silence(sentence_index: usize, sample_rate: u32) -> Self {
+        Self {
+            sentence_index,
+            samples: Arc::from(Vec::new()),
+            sample_rate,
+        }
+    }
 }
 
 /// Owns a sherpa-onnx `OfflineTts`. Construct and call on one thread.
@@ -93,8 +120,9 @@ impl Synthesizer {
             .ok_or_else(|| anyhow!("generate_with_config returned None for sentence {index}"))?;
         Ok(SynthPcm {
             sentence_index: index,
-            // `samples()` borrows a C-owned buffer; copy it to own it.
-            samples: audio.samples().to_vec(),
+            // `samples()` borrows a C-owned buffer; `Arc::from(&[f32])` copies it
+            // once into an owned, shareable allocation.
+            samples: Arc::from(audio.samples()),
             sample_rate: audio.sample_rate() as u32,
         })
     }
