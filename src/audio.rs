@@ -72,6 +72,7 @@ pub struct Spine {
     shared: Arc<Shared>,
     device_rate: u32,
     channels: u16,
+    ring_capacity: u64,
     wav_path: PathBuf,
 }
 
@@ -87,28 +88,21 @@ pub struct Report {
 }
 
 impl Spine {
-    /// Open the default output device, start the stream, and spawn the feeder.
+    /// Open the default output device and start the stream, spawning the feeder.
+    /// If no usable audio output is available (any step fails — no device, bad
+    /// format, build/play error), degrade to **WAV-only** rendering so narration
+    /// always completes; on a real session with a working device it plays live.
     pub fn start(pcm_rx: Receiver<SynthPcm>, cfg: SpineConfig, wav_path: PathBuf) -> Result<Spine> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .context("no default output device")?;
-        let supported = device
-            .default_output_config()
-            .context("no default output config")?;
-        if supported.sample_format() != cpal::SampleFormat::F32 {
-            return Err(anyhow!(
-                "default output sample format is {:?}; M0 expects f32 (the macOS default)",
-                supported.sample_format()
-            ));
-        }
-        let config: cpal::StreamConfig = supported.config();
-        let device_rate = config.sample_rate; // cpal 0.18: SampleRate = u32
-        let channels = config.channels;
+        // Query the device config first so the ring can be sized to its rate.
+        let device_cfg = try_open_device();
+        let (device_rate, channels) = match &device_cfg {
+            Ok((_, _, rate, ch)) => (*rate, *ch),
+            Err(_) => (44_100, 2), // sane defaults for WAV-only rendering
+        };
 
         let ring_capacity = ((device_rate as u64) * (channels as u64) * (cfg.ring_ms as u64) / 1000)
             .max(channels as u64 * 64) as usize;
-        let (producer, mut consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity);
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity);
 
         let shared = Arc::new(Shared {
             samples_pushed: AtomicU64::new(0),
@@ -119,51 +113,34 @@ impl Spine {
             feeder_done: AtomicBool::new(false),
         });
 
-        // --- RT callback: pure ring drain + relaxed atomics. No alloc/lock/IO.
-        let cb = Arc::clone(&shared);
-        let data_cb = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            if !cb.started.load(Relaxed) {
-                data.iter_mut().for_each(|s| *s = 0.0);
-                return;
-            }
-            let mut consumed = 0u64;
-            let mut under = 0u64;
-            for s in data.iter_mut() {
-                match consumer.pop() {
-                    Ok(v) => {
-                        *s = v;
-                        consumed += 1;
-                    }
-                    Err(_) => {
-                        *s = 0.0;
-                        under += 1;
-                    }
+        let stream = match device_cfg {
+            Ok((device, config, _, _)) => match build_and_play(&device, config, &shared, consumer) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("[spine] could not start audio output ({e}); rendering to WAV only.");
+                    mark_no_device(&shared);
+                    None
                 }
-            }
-            if consumed > 0 {
-                cb.samples_consumed.fetch_add(consumed, Relaxed);
-            }
-            if under > 0 {
-                cb.underruns.fetch_add(under, Relaxed);
+            },
+            Err(e) => {
+                eprintln!("[spine] no usable audio output ({e}); rendering to WAV only.");
+                drop(consumer);
+                mark_no_device(&shared);
+                None
             }
         };
-        let err_cb = |err| eprintln!("[cpal] stream error: {err}");
-
-        let stream = device
-            .build_output_stream(config, data_cb, err_cb, None) // cpal 0.18: by value
-            .context("failed to build output stream")?;
-        stream.play().context("failed to start output stream")?;
 
         let feeder_shared = Arc::clone(&shared);
         let feeder =
             thread::spawn(move || feed(pcm_rx, producer, device_rate, channels, cfg, feeder_shared));
 
         Ok(Spine {
-            stream: Some(stream),
+            stream,
             feeder: Some(feeder),
             shared,
             device_rate,
             channels,
+            ring_capacity: ring_capacity as u64,
             wav_path,
         })
     }
@@ -173,52 +150,69 @@ impl Spine {
     /// so it can finish teeing the WAV.
     pub fn wait_until_drained(&self, max: Duration) {
         let start = Instant::now();
-        let mut last_consumed = 0u64;
-        let mut last_progress = Instant::now();
+        // 60 ms of audio: "the device clearly pulled real samples".
+        let min_live = (self.device_rate as u64 * self.channels as u64 * 60 / 1000).max(1);
+
         let mut started_at: Option<Instant> = None;
-        // A working device drains exactly device_rate*channels interleaved
-        // samples/sec; a dead or trickling one drains far slower.
-        let expected_rate = self.device_rate as f64 * self.channels as f64;
+        let mut live = false; // latched once the device proves it drains
+        let mut last_consumed = 0u64;
+        let mut last_change = Instant::now();
+
         loop {
             let consumed = self.shared.samples_consumed.load(Relaxed);
             let pushed = self.shared.samples_pushed.load(Relaxed);
+
             if self.shared.feeder_done.load(Relaxed) && consumed >= pushed {
                 break; // fully drained
             }
             if self.shared.consumer_dead.load(Relaxed) {
                 break;
             }
-            if self.shared.started.load(Relaxed) && started_at.is_none() {
-                started_at = Some(Instant::now());
-            }
-            if consumed != last_consumed {
-                last_consumed = consumed;
-                last_progress = Instant::now();
-            }
-            if let Some(t) = started_at {
-                // Stalled: no progress at all for 2s.
-                if last_progress.elapsed() > Duration::from_secs(2) {
-                    eprintln!("[spine] no audio drain for 2s — no usable output device.");
-                    self.shared.consumer_dead.store(true, Relaxed);
-                    break;
-                }
-                // Trickling: after a 3s grace, draining far below real time.
-                let secs = t.elapsed().as_secs_f64();
-                if secs > 3.0 && (consumed as f64 / secs) < expected_rate * 0.25 {
-                    eprintln!(
-                        "[spine] output draining at {:.0}/s vs ~{:.0}/s expected — no usable device.",
-                        consumed as f64 / secs,
-                        expected_rate
-                    );
-                    self.shared.consumer_dead.store(true, Relaxed);
-                    break;
-                }
-            }
             if start.elapsed() > max {
                 eprintln!("[spine] drain wait hit the {}s cap.", max.as_secs());
                 self.shared.consumer_dead.store(true, Relaxed);
                 break;
             }
+
+            if self.shared.started.load(Relaxed) && started_at.is_none() {
+                started_at = Some(Instant::now());
+                last_change = Instant::now();
+            }
+            if consumed != last_consumed {
+                last_consumed = consumed;
+                last_change = Instant::now();
+                if consumed >= min_live {
+                    live = true;
+                }
+            }
+
+            if let Some(sa) = started_at {
+                if !live {
+                    // Probe: a real device drains the prebuffer within a few
+                    // seconds; a headless context never pulls.
+                    if sa.elapsed() > Duration::from_secs(3) {
+                        eprintln!("[spine] no audio drained after start — no usable output device.");
+                        self.shared.consumer_dead.store(true, Relaxed);
+                        break;
+                    }
+                } else if last_change.elapsed() > Duration::from_secs(4) {
+                    // Live but consumption stalled. Distinguish a dead device
+                    // (a full ring nobody is draining) from a legitimate gap
+                    // (ring empty, waiting on synthesis / Ollama).
+                    let occupancy = pushed.saturating_sub(consumed);
+                    if occupancy * 2 >= self.ring_capacity {
+                        eprintln!(
+                            "[spine] device stopped draining a buffered ring — assuming disconnect."
+                        );
+                        self.shared.consumer_dead.store(true, Relaxed);
+                        break;
+                    }
+                    // Ring is near-empty: waiting on more audio. Keep waiting,
+                    // but reset the window so the next stall is judged fresh.
+                    last_change = Instant::now();
+                }
+            }
+
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -246,6 +240,76 @@ impl Spine {
             wav_path: self.wav_path.display().to_string(),
         })
     }
+}
+
+/// Query the default output device and its f32 config (rate, channels).
+fn try_open_device() -> Result<(cpal::Device, cpal::StreamConfig, u32, u16)> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .context("no default output device")?;
+    let supported = device
+        .default_output_config()
+        .context("no default output config")?;
+    anyhow::ensure!(
+        supported.sample_format() == cpal::SampleFormat::F32,
+        "default output format is {:?}, not f32",
+        supported.sample_format()
+    );
+    let config: cpal::StreamConfig = supported.config();
+    let rate = config.sample_rate; // cpal 0.18: SampleRate = u32
+    let channels = config.channels;
+    Ok((device, config, rate, channels))
+}
+
+/// Build and start the output stream whose RT callback only drains the ring
+/// (no alloc/lock/IO) into the output buffer, writing silence on underrun.
+fn build_and_play(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    shared: &Arc<Shared>,
+    mut consumer: rtrb::Consumer<f32>,
+) -> Result<cpal::Stream> {
+    let cb = Arc::clone(shared);
+    let data_cb = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        if !cb.started.load(Relaxed) {
+            data.iter_mut().for_each(|s| *s = 0.0);
+            return;
+        }
+        let mut consumed = 0u64;
+        let mut under = 0u64;
+        for s in data.iter_mut() {
+            match consumer.pop() {
+                Ok(v) => {
+                    *s = v;
+                    consumed += 1;
+                }
+                Err(_) => {
+                    *s = 0.0;
+                    under += 1;
+                }
+            }
+        }
+        if consumed > 0 {
+            cb.samples_consumed.fetch_add(consumed, Relaxed);
+        }
+        if under > 0 {
+            cb.underruns.fetch_add(under, Relaxed);
+        }
+    };
+    let err_cb = |err| eprintln!("[cpal] stream error: {err}");
+    let stream = device
+        .build_output_stream(config, data_cb, err_cb, None) // cpal 0.18: by value
+        .context("failed to build output stream")?;
+    stream.play().context("failed to start output stream")?;
+    Ok(stream)
+}
+
+/// No usable device: pre-flag dead + started so the feeder tees the WAV without
+/// blocking on a ring nobody drains.
+fn mark_no_device(shared: &Arc<Shared>) {
+    shared.consumer_dead.store(true, Relaxed);
+    shared.started.store(true, Relaxed);
 }
 
 /// Feeder thread body: PCM channel -> resample -> ring (+ WAV tee).

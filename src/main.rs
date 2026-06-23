@@ -1,13 +1,15 @@
 //! tech-reader — reads code/comments/specs aloud-but-explained.
 //!
-//! M1: segment a file into typed blocks, narrate them offline with the
-//! deterministic humanizer, and speak the resulting sentences gaplessly through
-//! the M0 audio spine. (AI narration via Ollama arrives in M2.)
+//! M2: segment a file into typed blocks, then stream an explanation of each
+//! block from local Ollama (speech starts before a block finishes), falling back
+//! to the deterministic humanizer when Ollama is unreachable, and speak the
+//! resulting sentences gaplessly through the audio spine.
 
 mod audio;
 mod blocks;
 mod humanize;
 mod narrate;
+mod ollama;
 mod sentence;
 mod tts;
 mod types;
@@ -21,34 +23,62 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use audio::{Spine, SpineConfig};
-use narrate::{narrate_offline, NarrationSettings};
+use narrate::{stream_narration, NarrationSettings};
+use ollama::OllamaConfig;
 use tts::{SynthPcm, Synthesizer};
 
-/// Hardcoded narration shown when no file is given (the M0 spine demo).
-const DEMO_SENTENCES: &[&str] = &[
-    "Welcome to tech reader.",
-    "Give me a path to a source file or a markdown document, and I will read it aloud, explained.",
-    "Right now I am running the offline humanizer: no Ollama, no cloud, everything on device.",
-    "Each sentence is synthesized ahead of playback and streamed through one continuously open audio device, so there is no gap between sentences.",
-];
+/// Narrated when no file is given.
+const WELCOME_MD: &str = "\
+# tech-reader
+
+Give me a path to a source file or a markdown document, and I will read it aloud, \
+explained. By default I ask a local Ollama model to rewrite each block into spoken \
+prose; if Ollama is not running, I fall back to a deterministic offline humanizer, \
+so I always work. Either way the audio is gapless.
+";
+
+const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+const DEFAULT_MODEL: &str = "llama3.2";
 
 struct Args {
     file: Option<PathBuf>,
     /// Print the narration text and exit (no synthesis/audio).
     text_only: bool,
+    model: String,
+    ollama_url: String,
 }
 
 fn parse_args() -> Args {
     let mut file = None;
     let mut text_only = false;
-    for arg in std::env::args().skip(1) {
+    let mut model = std::env::var("TECH_READER_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let mut ollama_url =
+        std::env::var("TECH_READER_OLLAMA").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
+
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "--text" | "--no-audio" => text_only = true,
+            "--model" | "-m" => {
+                if let Some(v) = it.next() {
+                    model = v;
+                }
+            }
+            "--ollama" => {
+                if let Some(v) = it.next() {
+                    ollama_url = v;
+                }
+            }
             s if s.starts_with('-') => eprintln!("[args] ignoring unknown flag: {s}"),
             s => file = Some(PathBuf::from(s)),
         }
     }
-    Args { file, text_only }
+    Args {
+        file,
+        text_only,
+        model,
+        ollama_url,
+    }
 }
 
 /// Map a file extension to a language id the segmenter understands. Unknown
@@ -90,28 +120,8 @@ fn lang_from_path(path: &Path) -> String {
     lang.to_string()
 }
 
-/// Produce the ordered narration sentence texts for the requested input.
-fn build_narration(args: &Args) -> Result<Vec<String>> {
-    let Some(file) = &args.file else {
-        return Ok(DEMO_SENTENCES.iter().map(|s| s.to_string()).collect());
-    };
-    let source = std::fs::read_to_string(file)
-        .with_context(|| format!("could not read {}", file.display()))?;
-    let lang = lang_from_path(file);
-    let blocks = blocks::segment_blocks(&source, &lang, 1);
-    let sentences = narrate_offline(&blocks, "en", &NarrationSettings::default());
-    eprintln!(
-        "[narrate] {} ({}) -> {} blocks -> {} sentences",
-        file.display(),
-        if lang.is_empty() { "prose" } else { &lang },
-        blocks.len(),
-        sentences.len()
-    );
-    Ok(sentences.into_iter().map(|s| s.text).collect())
-}
-
-/// M1 voice: the locally pre-extracted dev voice. Real first-run provisioning
-/// (download + sha256 verify + atomic rename) lands in M6.
+/// M2 voice: the locally pre-extracted dev voice. Real first-run provisioning
+/// lands in M6.
 fn voice_dir() -> PathBuf {
     std::env::var("TECH_READER_VOICE_DIR")
         .map(PathBuf::from)
@@ -121,16 +131,54 @@ fn voice_dir() -> PathBuf {
 fn main() -> Result<()> {
     let args = parse_args();
 
-    let texts = build_narration(&args)?;
-    if texts.is_empty() {
+    let (source, lang, label) = match &args.file {
+        Some(f) => (
+            std::fs::read_to_string(f).with_context(|| format!("could not read {}", f.display()))?,
+            lang_from_path(f),
+            f.display().to_string(),
+        ),
+        None => (WELCOME_MD.to_string(), "markdown".to_string(), "<welcome>".to_string()),
+    };
+
+    let document = blocks::segment_blocks(&source, &lang, 1);
+    if document.is_empty() {
         eprintln!("Nothing readable to narrate.");
         return Ok(());
     }
+    eprintln!(
+        "[narrate] {} ({}) -> {} blocks",
+        label,
+        if lang.is_empty() { "prose" } else { &lang },
+        document.len()
+    );
+
+    let cfg = OllamaConfig::new(args.ollama_url.clone(), args.model.clone());
+    let settings = NarrationSettings::default();
+
+    // Sentence look-ahead (bounded 16): the narrator blocks when the consumer
+    // falls behind — back-pressure all the way to Ollama.
+    let (sent_tx, sent_rx) = sync_channel::<String>(16);
+
+    // Narrator runs on its own OS thread with a current-thread tokio runtime
+    // (the only async work is the Ollama HTTP stream).
+    let narrator = thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("[narrate] could not start runtime: {e}");
+                return;
+            }
+        };
+        rt.block_on(stream_narration(&document, &settings, &cfg, "en", sent_tx));
+    });
 
     if args.text_only {
-        for (i, t) in texts.iter().enumerate() {
+        let mut i = 0;
+        while let Ok(t) = sent_rx.recv() {
             println!("{i:>3}  {t}");
+            i += 1;
         }
+        let _ = narrator.join();
         return Ok(());
     }
 
@@ -144,38 +192,40 @@ fn main() -> Result<()> {
         model.display()
     );
 
-    // Bounded look-ahead (depth 2): the synth worker blocks when two sentences
-    // of PCM are queued — the primary back-pressure valve.
     let (pcm_tx, pcm_rx) = sync_channel::<SynthPcm>(2);
-
     let spine = Spine::start(pcm_rx, SpineConfig::default(), PathBuf::from("out/narration.wav"))
         .context("failed to start audio spine")?;
 
+    // Synth worker: pulls sentence texts, synthesizes ahead into the bounded
+    // PCM channel (the primary back-pressure valve).
     let synth = thread::spawn(move || -> Result<()> {
         let engine = Synthesizer::new_vits(&model, &tokens, &data_dir, 1.0)
             .context("failed to create synthesizer")?;
         eprintln!("[synth] voice sample rate: {} Hz", engine.sample_rate());
-        for (i, text) in texts.iter().enumerate() {
-            let pcm = engine.synthesize(i, text, 0, 1.0)?;
+        let mut i = 0;
+        while let Ok(text) = sent_rx.recv() {
+            let pcm = engine.synthesize(i, &text, 0, 1.0)?;
             if pcm_tx.send(pcm).is_err() {
                 break; // feeder gone
             }
+            i += 1;
         }
         Ok(())
     });
 
-    // Long documents can play for many minutes; the headless rate-detection
-    // bails fast when there is no real device, so this cap is just a backstop.
     let started = Instant::now();
     spine.wait_until_drained(Duration::from_secs(3600));
+    let _ = narrator.join();
 
-    match synth.join() {
+    let synth_result = synth.join();
+
+    let report = spine.finish()?;
+    match synth_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e.context("synth worker failed")),
         Err(_) => anyhow::bail!("synth worker panicked"),
     }
 
-    let report = spine.finish()?;
     eprintln!(
         "[done] device {} Hz x{} ch | {} frames | underruns {} | {:.1}s wall | wav {}",
         report.device_rate,
