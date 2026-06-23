@@ -151,6 +151,7 @@ fn event_loop(
                         KeyCode::Right => {
                             seek(transport, &mut view, (pos + 1).min(total.saturating_sub(1)))
                         }
+                        KeyCode::Enter => commit_selection(transport, &mut view),
                         KeyCode::Char('-') | KeyCode::Char('_') => {
                             change_speed(transport, &mut view, pos, -1)
                         }
@@ -176,6 +177,16 @@ fn seek(transport: &Transport, view: &mut View, target: usize) {
     transport.seek_to(target);
     view.selected = target;
     view.follow = true;
+}
+
+/// Commit the browse selection (Enter): jump the playhead to the highlighted
+/// section. A no-op while following, since the cursor already tracks the
+/// playhead and there is no pending selection to apply.
+fn commit_selection(transport: &Transport, view: &mut View) {
+    if !view.follow {
+        let target = view.selected;
+        seek(transport, view, target);
+    }
 }
 
 /// Step the speed by `delta` along the ladder and resume at `current`.
@@ -238,16 +249,18 @@ fn ui(frame: &mut Frame, sentences: &[String], current: Option<usize>, view: &Vi
         let waiting = Paragraph::new("Starting narration…").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(waiting, rows[1]);
     } else {
-        // Wrap each sentence to the available width; the current/selected row is
-        // highlighted and auto-scrolled into view by ListState.
+        // Wrap each sentence to the available width; the active cursor row is
+        // auto-scrolled into view by ListState.
         let width = rows[1].width.saturating_sub(2).max(1) as usize;
+        // The playhead (what's audible right now) is always painted, so the
+        // reading position stays visible even while the user browses elsewhere.
+        let playhead = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
         let items: Vec<ListItem> = sentences
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let is_current = current == Some(i);
-                let base = if is_current {
-                    Style::default().fg(Color::White)
+                let base = if current == Some(i) {
+                    playhead
                 } else {
                     Style::default().fg(Color::Gray)
                 };
@@ -259,9 +272,22 @@ fn ui(frame: &mut Frame, sentences: &[String], current: Option<usize>, view: &Vi
             })
             .collect();
 
+        // The active cursor (the row ListState scrolls to and marks). While
+        // following it *is* the playhead; while browsing it's the pending jump
+        // target — shown in a distinct colour and symbol so it reads as a
+        // selection to commit with Enter, not the reading position.
+        let (cursor_style, cursor_symbol) = if view.follow {
+            (playhead, "▸ ")
+        } else {
+            (
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                "» ",
+            )
+        };
+
         let list = List::new(items)
-            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .highlight_symbol("▸ ")
+            .highlight_style(cursor_style)
+            .highlight_symbol(cursor_symbol)
             .scroll_padding(2);
 
         let mut state = ListState::default();
@@ -313,9 +339,9 @@ fn fmt_speed(speed: f32) -> String {
 
 fn footer(follow: bool) -> Paragraph<'static> {
     let hint = if follow {
-        "space pause · ←/→ seek · −/+ speed · ↑/↓ scroll · q quit"
+        "space pause · ←/→ seek · −/+ speed · ↑/↓ select · q quit"
     } else {
-        "space pause · ←/→ seek · −/+ speed · ↑/↓ scroll · f follow · q quit"
+        "↑/↓ select · ⏎ jump · f follow · space pause · ←/→ seek · −/+ speed · q quit"
     };
     Paragraph::new(Line::from(Span::styled(
         hint,
@@ -388,6 +414,40 @@ mod tests {
             .draw(|f| ui(f, sentences, current, &view, &status))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// Render with an explicit `View`, so a test can set a browse cursor
+    /// (`selected`) independent of the audible `current`.
+    fn render_view(
+        sentences: &[String],
+        current: Option<usize>,
+        view: &View,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let status = Status {
+            paused: false,
+            finished: false,
+            speed: SPEED_LADDER[DEFAULT_SPEED_STEP],
+            underruns: 0,
+        };
+        terminal
+            .draw(|f| ui(f, sentences, current, view, &status))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The background colour of the first highlighted cell on the row holding
+    /// `needle`, if any (the per-row highlight is a solid block).
+    fn row_highlight_bg(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<Color> {
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains(needle) {
+                return (0..buf.area.width)
+                    .map(|x| buf[(x, y)].bg)
+                    .find(|bg| *bg == Color::Cyan || *bg == Color::Yellow);
+            }
+        }
+        None
     }
 
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
@@ -501,5 +561,77 @@ mod tests {
         assert!(v.follow, "seek re-enables follow so the highlight pins to the target");
         assert_eq!(t.seek_target(), 4);
         assert_eq!(t.generation(), 1);
+    }
+
+    #[test]
+    fn browsing_marks_selection_distinct_from_playhead() {
+        // Audible at sentence 0 (playhead), browse cursor parked on sentence 2.
+        let s = vec![
+            "Alpha line.".to_string(),
+            "Beta line.".to_string(),
+            "Gamma line.".to_string(),
+        ];
+        let view = View {
+            follow: false,
+            selected: 2,
+            speed_step: DEFAULT_SPEED_STEP,
+        };
+        let buf = render_view(&s, Some(0), &view);
+        // The playhead stays visible (cyan) even though the cursor is elsewhere,
+        // and the selection reads in a distinct colour (yellow), not as a second
+        // playhead — so the user can tell "reading here" from "jump target here".
+        assert_eq!(
+            row_highlight_bg(&buf, "Alpha"),
+            Some(Color::Cyan),
+            "playhead row should stay cyan while browsing"
+        );
+        assert_eq!(
+            row_highlight_bg(&buf, "Gamma"),
+            Some(Color::Yellow),
+            "browse selection should be a distinct colour"
+        );
+    }
+
+    #[test]
+    fn following_cursor_is_the_playhead() {
+        // While following there is no separate selection: the cursor is cyan.
+        let s = vec!["Alpha line.".to_string(), "Beta line.".to_string()];
+        let view = View {
+            follow: true,
+            selected: 1,
+            speed_step: DEFAULT_SPEED_STEP,
+        };
+        let buf = render_view(&s, Some(1), &view);
+        assert_eq!(row_highlight_bg(&buf, "Beta"), Some(Color::Cyan));
+        assert!(
+            row_highlight_bg(&buf, "Alpha").is_none(),
+            "no yellow selection should appear while following"
+        );
+    }
+
+    #[test]
+    fn enter_commits_browse_selection() {
+        let t = Transport::new(1.0);
+        let mut v = View {
+            follow: false,
+            selected: 7,
+            speed_step: DEFAULT_SPEED_STEP,
+        };
+        commit_selection(&t, &mut v);
+        assert_eq!(t.seek_target(), 7, "Enter jumps the playhead to the selection");
+        assert_eq!(t.generation(), 1);
+        assert!(v.follow, "committing re-enables follow so the highlight pins to the target");
+    }
+
+    #[test]
+    fn enter_is_noop_while_following() {
+        let t = Transport::new(1.0);
+        let mut v = View {
+            follow: true,
+            selected: 3,
+            speed_step: DEFAULT_SPEED_STEP,
+        };
+        commit_selection(&t, &mut v);
+        assert_eq!(t.generation(), 0, "no seek is published when there is no pending selection");
     }
 }
