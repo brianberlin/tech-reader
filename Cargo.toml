@@ -32,6 +32,7 @@ futures-util = "0.3"
 
 # --- Text processing ---
 unicode-segmentation = "1.13"  # sentence boundaries (replaces Intl.Segmenter)
+regex = "1"                    # block-scanner patterns (lookaround cases are hand-rolled)
 
 # --- TUI (M4) ---
 ratatui = "0.30"       # default features pull in the crossterm backend
