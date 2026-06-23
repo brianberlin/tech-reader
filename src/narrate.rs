@@ -166,9 +166,9 @@ pub async fn stream_narration(
     let dict: HashMap<String, String> = HashMap::new();
     let mut use_ai = is_available(&cfg.base_url, Duration::from_millis(2000)).await;
     if use_ai {
-        eprintln!("[narrate] explaining with {} via {}", cfg.model, cfg.base_url);
+        crate::diag!("[narrate] explaining with {} via {}", cfg.model, cfg.base_url);
     } else {
-        eprintln!(
+        crate::diag!(
             "[narrate] Ollama unreachable at {} — using the offline humanizer.",
             cfg.base_url
         );
@@ -281,7 +281,7 @@ async fn stream_block(
         }
         Err(e) if e.code == OllamaErrorCode::Aborted => StreamOutcome::Stop,
         Err(e) => {
-            eprintln!(
+            crate::diag!(
                 "[narrate] block at line {}: {} — offline humanizer for the rest.",
                 block.start_line, e
             );

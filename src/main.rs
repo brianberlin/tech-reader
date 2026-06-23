@@ -9,18 +9,23 @@
 mod audio;
 mod blocks;
 mod cache;
+#[macro_use]
+mod diag;
 mod humanize;
 mod narrate;
 mod ollama;
 mod sentence;
 mod tts;
+mod tui;
 mod types;
 mod wav;
 
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::sync_channel;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -109,7 +114,7 @@ fn parse_args() -> std::result::Result<Args, AppError> {
                     return Err(AppError::new(exit::USAGE, anyhow!("--ollama requires a value")))
                 }
             },
-            s if s.starts_with('-') => eprintln!("[args] ignoring unknown flag: {s}"),
+            s if s.starts_with('-') => crate::diag!("[args] ignoring unknown flag: {s}"),
             s => file = Some(PathBuf::from(s)),
         }
     }
@@ -204,6 +209,14 @@ fn main() {
 fn run() -> std::result::Result<(), AppError> {
     let args = parse_args()?;
 
+    // Use the full-screen TUI only on a real terminal and not in --text mode.
+    // It silences `[stage]` diagnostics so they don't corrupt the screen; if it
+    // turns out there is no audio device, we re-enable them for the headless path.
+    let want_tui = std::io::stdout().is_terminal() && !args.text_only;
+    if want_tui {
+        diag::set_quiet(true);
+    }
+
     let (source, lang, label) = match &args.file {
         Some(f) => (
             std::fs::read_to_string(f).map_err(|e| {
@@ -227,7 +240,7 @@ fn run() -> std::result::Result<(), AppError> {
         eprintln!("Nothing readable to narrate.");
         return Ok(());
     }
-    eprintln!(
+    crate::diag!(
         "[narrate] {} ({}) -> {} blocks",
         label,
         if lang.is_empty() { "prose" } else { &lang },
@@ -250,7 +263,7 @@ fn run() -> std::result::Result<(), AppError> {
         {
             Ok(rt) => rt,
             Err(e) => {
-                eprintln!("[narrate] could not start runtime: {e}");
+                crate::diag!("[narrate] could not start runtime: {e}");
                 return;
             }
         };
@@ -287,25 +300,47 @@ fn run() -> std::result::Result<(), AppError> {
     let length_scale = 1.0f32; // base pace; the speed ladder lands in M5
     let speed = 1.0f32;
 
+    // The narration list the TUI renders. The synth worker appends each sentence
+    // as it receives it, at the same index the boundary table uses — so the
+    // audible-sentence highlight indexes straight into this Vec.
+    let sentences: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let synth_sentences = Arc::clone(&sentences);
+
+    // Cancellation for a clean TUI quit: the synth worker polls it so it leaves
+    // sherpa-onnx FFI before we tear down (abandoning a thread mid-FFI crashes on
+    // exit when onnxruntime runs its static destructors).
+    let cancel = Arc::new(AtomicBool::new(false));
+    let synth_cancel = Arc::clone(&cancel);
+
     // Look-ahead: 2 sentences of synthesized PCM. The bounded send is the
     // primary back-pressure valve (the synth worker parks when it's full).
     let (pcm_tx, pcm_rx) = sync_channel::<SynthPcm>(2);
-    let spine = Spine::start(pcm_rx, SpineConfig::default(), PathBuf::from("out/narration.wav"))
+    let mut spine = Spine::start(pcm_rx, SpineConfig::default(), PathBuf::from("out/narration.wav"))
         .map_err(|e| AppError::new(exit::DEVICE, e))?;
 
-    // Synth worker: pulls sentence texts, serves them from the PCM cache or
-    // synthesizes ahead into the bounded PCM channel, skipping (with aligned
-    // silence) on failure and aborting after too many in a row.
+    // Synth worker: pulls sentence texts, records them for display, serves them
+    // from the PCM cache or synthesizes ahead into the bounded PCM channel,
+    // skipping (with aligned silence) on failure and aborting after too many.
     let synth = thread::spawn(move || -> Result<()> {
         let engine = Synthesizer::new_vits(&model, &tokens, &data_dir, length_scale)
             .context("failed to create synthesizer")?;
         let rate = engine.sample_rate();
-        eprintln!("[synth] voice sample rate: {rate} Hz");
+        crate::diag!("[synth] voice sample rate: {rate} Hz");
 
         let mut cache = PcmCache::new(cap_bytes);
         let mut i = 0usize;
         let mut consecutive = 0u32;
-        while let Ok(text) = sent_rx.recv() {
+        loop {
+            if synth_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let text = match sent_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(t) => t,
+                Err(RecvTimeoutError::Timeout) => continue, // re-check cancel
+                Err(RecvTimeoutError::Disconnected) => break, // narrator done
+            };
+            // Record at index i (== the SynthPcm/boundary index) before synth.
+            synth_sentences.lock().unwrap().push(text.clone());
             let pcm = match synth_one(
                 &engine,
                 &mut cache,
@@ -324,7 +359,7 @@ fn run() -> std::result::Result<(), AppError> {
             }
             i += 1;
         }
-        eprintln!(
+        crate::diag!(
             "[synth] cache: {} entries, {} KB",
             cache.len(),
             cache.len_bytes() / 1024
@@ -332,6 +367,23 @@ fn run() -> std::result::Result<(), AppError> {
         Ok(())
     });
 
+    // TUI path: only with a live output stream (otherwise the highlight could
+    // never advance). On quit, tear down cleanly (§5.3): signal cancel, stop the
+    // stream, join the synth worker so it is out of FFI, then join the feeder.
+    // The narrator (pure-Rust HTTP) is left for the OS to reap on exit.
+    if want_tui && spine.has_output_stream() {
+        let res = tui::run(Arc::clone(&sentences), &spine);
+        cancel.store(true, Ordering::Relaxed);
+        spine.stop_audio();
+        let _ = synth.join();
+        let _ = spine.finish();
+        return res.map_err(|e| AppError::new(exit::DEVICE, anyhow!("tui error: {e}")));
+    }
+
+    // Headless path: render to WAV / play to completion, then report.
+    if want_tui {
+        diag::set_quiet(false); // TTY but no device — let diagnostics through
+    }
     let started = Instant::now();
     spine.wait_until_drained(Duration::from_secs(3600));
     let _ = narrator.join();
@@ -364,7 +416,7 @@ fn synth_one(
     consecutive: &mut u32,
 ) -> Result<Option<SynthPcm>> {
     if fail_set.contains(&index) {
-        eprintln!("[synth] sentence {index} forced failure (debug) — skipping (silence).");
+        crate::diag!("[synth] sentence {index} forced failure (debug) — skipping (silence).");
         return skip(consecutive, index);
     }
 
@@ -381,7 +433,7 @@ fn synth_one(
             Ok(Some(pcm))
         }
         Err(e) => {
-            eprintln!("[synth] sentence {index} failed: {e:#} — skipping (silence).");
+            crate::diag!("[synth] sentence {index} failed: {e:#} — skipping (silence).");
             skip(consecutive, index)
         }
     }

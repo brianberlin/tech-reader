@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -70,12 +70,20 @@ struct Shared {
     feeder_waiting: AtomicBool,
 }
 
+/// Maps a cumulative interleaved-sample offset to the sentence index whose audio
+/// begins there. Appended by the feeder in order (so it is sorted by offset);
+/// the TUI binary-searches it against `samples_consumed` to find the audible
+/// sentence. Wrapped in a `Mutex` — written by the feeder, read by the TUI; the
+/// real-time callback never touches it.
+type Boundaries = Arc<Mutex<Vec<(u64, usize)>>>;
+
 pub struct Spine {
     stream: Option<cpal::Stream>,
     feeder: Option<JoinHandle<()>>,
     /// Low-priority out-of-band underrun logger (live device only).
     monitor: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
+    boundaries: Boundaries,
     device_rate: u32,
     channels: u16,
     ring_capacity: u64,
@@ -124,23 +132,35 @@ impl Spine {
             Ok((device, config, _, _)) => match build_and_play(&device, config, &shared, consumer) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    eprintln!("[spine] could not start audio output ({e}); rendering to WAV only.");
+                    crate::diag!("[spine] could not start audio output ({e}); rendering to WAV only.");
                     mark_no_device(&shared);
                     None
                 }
             },
             Err(e) => {
-                eprintln!("[spine] no usable audio output ({e}); rendering to WAV only.");
+                crate::diag!("[spine] no usable audio output ({e}); rendering to WAV only.");
                 drop(consumer);
                 mark_no_device(&shared);
                 None
             }
         };
 
+        let boundaries: Boundaries = Arc::new(Mutex::new(Vec::new()));
+
         let feeder_shared = Arc::clone(&shared);
         let feed_wav = wav_path.clone();
+        let feed_bounds = Arc::clone(&boundaries);
         let feeder = thread::spawn(move || {
-            feed(pcm_rx, producer, device_rate, channels, cfg, feeder_shared, feed_wav)
+            feed(
+                pcm_rx,
+                producer,
+                device_rate,
+                channels,
+                cfg,
+                feeder_shared,
+                feed_wav,
+                feed_bounds,
+            )
         });
 
         // The out-of-band underrun monitor only makes sense with a live device
@@ -154,11 +174,49 @@ impl Spine {
             feeder: Some(feeder),
             monitor,
             shared,
+            boundaries,
             device_rate,
             channels,
             ring_capacity: ring_capacity as u64,
             wav_path,
         })
+    }
+
+    /// Whether an audio output stream was opened (vs. WAV-only rendering).
+    pub fn has_output_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// The device was declared dead (never drained, disconnected, or no device).
+    pub fn is_consumer_dead(&self) -> bool {
+        self.shared.consumer_dead.load(Relaxed)
+    }
+
+    /// All input has been fed and every pushed sample has been played out.
+    pub fn is_finished(&self) -> bool {
+        self.shared.feeder_done.load(Relaxed)
+            && self.shared.samples_consumed.load(Relaxed) >= self.shared.samples_pushed.load(Relaxed)
+    }
+
+    /// The sentence index currently audible, from frames consumed by the callback
+    /// resolved against the boundary table. `None` before the first sample plays.
+    pub fn current_sentence(&self) -> Option<usize> {
+        let consumed = self.shared.samples_consumed.load(Relaxed);
+        let b = self.boundaries.lock().unwrap();
+        sentence_at(&b, consumed)
+    }
+
+    /// Underrun count in per-channel frames (for a status line).
+    pub fn underruns(&self) -> u64 {
+        self.shared.underruns.load(Relaxed) / self.channels.max(1) as u64
+    }
+
+    /// Stop playback immediately: drop the output stream (quiescing the callback)
+    /// and tell the feeder to stop pushing. Used on TUI quit — the process exits
+    /// right after, so the remaining background threads are reaped by the OS.
+    pub fn stop_audio(&mut self) {
+        self.shared.consumer_dead.store(true, Relaxed);
+        self.stream.take();
     }
 
     /// Block until the ring is fully drained, or until it's clear no device is
@@ -185,7 +243,7 @@ impl Spine {
                 break;
             }
             if start.elapsed() > max {
-                eprintln!("[spine] drain wait hit the {}s cap.", max.as_secs());
+                crate::diag!("[spine] drain wait hit the {}s cap.", max.as_secs());
                 self.shared.consumer_dead.store(true, Relaxed);
                 break;
             }
@@ -207,7 +265,7 @@ impl Spine {
                     // Probe: a real device drains the prebuffer within a few
                     // seconds; a headless context never pulls.
                     if sa.elapsed() > Duration::from_secs(3) {
-                        eprintln!("[spine] no audio drained after start — no usable output device.");
+                        crate::diag!("[spine] no audio drained after start — no usable output device.");
                         self.shared.consumer_dead.store(true, Relaxed);
                         break;
                     }
@@ -217,7 +275,7 @@ impl Spine {
                     // (ring empty, waiting on synthesis / Ollama).
                     let occupancy = pushed.saturating_sub(consumed);
                     if occupancy * 2 >= self.ring_capacity {
-                        eprintln!(
+                        crate::diag!(
                             "[spine] device stopped draining a buffered ring — assuming disconnect."
                         );
                         self.shared.consumer_dead.store(true, Relaxed);
@@ -314,7 +372,7 @@ fn build_and_play(
             cb.underruns.fetch_add(under, Relaxed);
         }
     };
-    let err_cb = |err| eprintln!("[cpal] stream error: {err}");
+    let err_cb = |err| crate::diag!("[cpal] stream error: {err}");
     let stream = device
         .build_output_stream(config, data_cb, err_cb, None) // cpal 0.18: by value
         .context("failed to build output stream")?;
@@ -329,7 +387,9 @@ fn mark_no_device(shared: &Arc<Shared>) {
     shared.started.store(true, Relaxed);
 }
 
-/// Feeder thread body: PCM channel -> resample -> ring (+ streaming WAV tee).
+/// Feeder thread body: PCM channel -> resample -> ring (+ streaming WAV tee +
+/// boundary table).
+#[allow(clippy::too_many_arguments)]
 fn feed(
     pcm_rx: Receiver<SynthPcm>,
     mut producer: rtrb::Producer<f32>,
@@ -338,6 +398,7 @@ fn feed(
     cfg: SpineConfig,
     shared: Arc<Shared>,
     wav_path: PathBuf,
+    boundaries: Boundaries,
 ) {
     let silence_frames = (device_rate as u64 * cfg.silence_ms as u64 / 1000) as usize;
     let ramp_frames = (device_rate as u64 * cfg.ramp_ms as u64 / 1000).max(1) as usize;
@@ -349,7 +410,7 @@ fn feed(
     let mut wav = match wav::WavWriter::create(&wav_path, device_rate, channels) {
         Ok(w) => Some(w),
         Err(e) => {
-            eprintln!(
+            crate::diag!(
                 "[spine] could not open WAV tee at {} ({e}); continuing without it.",
                 wav_path.display()
             );
@@ -358,6 +419,7 @@ fn feed(
     };
 
     let trim_margin = (device_rate as usize * 10 / 1000).max(1); // ~10 ms keepout
+    let mut cumulative: u64 = 0; // interleaved samples pushed so far
 
     loop {
         shared.feeder_waiting.store(true, Relaxed);
@@ -366,6 +428,13 @@ fn feed(
             Err(_) => break, // all senders gone
         };
         shared.feeder_waiting.store(false, Relaxed);
+
+        // Record where this sentence's audio begins so the TUI can map the
+        // callback's consumed-sample count back to a sentence index.
+        boundaries
+            .lock()
+            .unwrap()
+            .push((cumulative, pcm.sentence_index));
 
         let resampled = resample_linear(&pcm.samples, pcm.sample_rate, device_rate);
         // Trim the voice's own leading/trailing near-silence so the only gap
@@ -387,10 +456,11 @@ fn feed(
             }
         }
         inter.resize(inter.len() + silence_frames * channels as usize, 0.0);
+        cumulative += inter.len() as u64;
 
         if let Some(w) = wav.as_mut() {
             if let Err(e) = w.write_frames(&inter) {
-                eprintln!("[spine] WAV tee write failed ({e}); dropping the tee.");
+                crate::diag!("[spine] WAV tee write failed ({e}); dropping the tee.");
                 wav = None;
             }
         }
@@ -404,7 +474,7 @@ fn feed(
 
     if let Some(w) = wav {
         if let Err(e) = w.finalize() {
-            eprintln!("[spine] WAV tee finalize failed ({e}).");
+            crate::diag!("[spine] WAV tee finalize failed ({e}).");
         }
     }
 }
@@ -433,7 +503,7 @@ fn spawn_underrun_monitor(shared: Arc<Shared>) -> JoinHandle<()> {
             if delta > 0 && !shared.feeder_waiting.load(Relaxed) {
                 bad_windows += 1;
                 if bad_windows >= 3 && !hinted {
-                    eprintln!(
+                    crate::diag!(
                         "[spine] sustained audio underruns while feeding \
                          — raise ring_ms or look-ahead depth."
                     );
@@ -536,5 +606,42 @@ fn apply_ramp(mono: &mut [f32], ramp: usize) {
         let g = i as f32 / r as f32;
         mono[i] *= g;
         mono[n - 1 - i] *= g;
+    }
+}
+
+/// Resolve a consumed interleaved-sample offset to the sentence playing there:
+/// the last boundary whose start is `<= consumed`. `boundaries` is sorted by
+/// start (the feeder appends in order). `None` before the first boundary.
+fn sentence_at(boundaries: &[(u64, usize)], consumed: u64) -> Option<usize> {
+    let pos = boundaries.partition_point(|&(start, _)| start <= consumed);
+    pos.checked_sub(1).map(|i| boundaries[i].1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sentence_at_maps_consumed_to_index() {
+        // Three sentences begin at interleaved offsets 0, 1000, 2500.
+        let b = [(0u64, 0usize), (1000, 1), (2500, 2)];
+        assert_eq!(sentence_at(&b, 0), Some(0)); // first sample -> sentence 0
+        assert_eq!(sentence_at(&b, 999), Some(0)); // still inside 0
+        assert_eq!(sentence_at(&b, 1000), Some(1)); // exactly at the 1 boundary
+        assert_eq!(sentence_at(&b, 2499), Some(1));
+        assert_eq!(sentence_at(&b, 2500), Some(2));
+        assert_eq!(sentence_at(&b, 9_999), Some(2)); // past the last start -> last
+        assert_eq!(sentence_at(&[], 5), None); // nothing fed yet
+    }
+
+    #[test]
+    fn sentence_at_handles_skipped_sentence_indices() {
+        // The feeder always records the SynthPcm's own index, so a skipped
+        // sentence still appears (as a short silent span) and the mapping never
+        // desyncs across it.
+        let b = [(0u64, 0usize), (500, 1), (560, 2), (620, 3)];
+        assert_eq!(sentence_at(&b, 540), Some(1));
+        assert_eq!(sentence_at(&b, 600), Some(2)); // the 60-sample skip span
+        assert_eq!(sentence_at(&b, 700), Some(3));
     }
 }
