@@ -32,6 +32,7 @@ type Backend = CrosstermBackend<Stdout>;
 
 /// Status shown in the header, computed once per frame from the spine.
 struct Status {
+    paused: bool,
     finished: bool,
     underruns: u64,
 }
@@ -90,6 +91,7 @@ fn event_loop(
         // we never hold the sentence lock and the boundary lock at once.
         let current = spine.current_sentence();
         let status = Status {
+            paused: spine.is_paused(),
             finished: spine.is_finished(),
             underruns: spine.underruns(),
         };
@@ -116,9 +118,17 @@ fn event_loop(
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    let total = sentences.lock().unwrap().len();
-                    if handle_key(key, &mut view, total) {
-                        break; // quit
+                    match key.code {
+                        // Pause/resume needs the spine; everything else is view-only.
+                        KeyCode::Char(' ') | KeyCode::Char('p') => {
+                            spine.set_paused(!spine.is_paused());
+                        }
+                        _ => {
+                            let total = sentences.lock().unwrap().len();
+                            if handle_key(key, &mut view, total) {
+                                break; // quit
+                            }
+                        }
                     }
                 }
             }
@@ -213,7 +223,9 @@ fn ui(frame: &mut Frame, sentences: &[String], current: Option<usize>, view: &Vi
 
 fn header(total: usize, current: Option<usize>, follow: bool, status: &Status) -> Paragraph<'static> {
     let pos = current.map(|c| c + 1).unwrap_or(0);
-    let state = if status.finished {
+    let state = if status.paused {
+        Span::styled("⏸ paused", Style::default().fg(Color::Yellow))
+    } else if status.finished {
         Span::styled("✓ done", Style::default().fg(Color::Green))
     } else {
         Span::styled("▶ reading", Style::default().fg(Color::Cyan))
@@ -239,9 +251,9 @@ fn header(total: usize, current: Option<usize>, follow: bool, status: &Status) -
 
 fn footer(follow: bool) -> Paragraph<'static> {
     let hint = if follow {
-        "↑/↓ scroll · q quit"
+        "space pause · ↑/↓ scroll · q quit"
     } else {
-        "↑/↓ scroll · f follow · q quit"
+        "space pause · ↑/↓ scroll · f follow · q quit"
     };
     Paragraph::new(Line::from(Span::styled(
         hint,
@@ -289,12 +301,22 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn render(sentences: &[String], current: Option<usize>, follow: bool) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        render_status(sentences, current, follow, false)
+    }
+
+    fn render_status(
+        sentences: &[String],
+        current: Option<usize>,
+        follow: bool,
+        paused: bool,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
         let view = View {
             follow,
             selected: current.unwrap_or(0),
         };
         let status = Status {
+            paused,
             finished: false,
             underruns: 0,
         };
@@ -359,5 +381,14 @@ mod tests {
     fn empty_shows_starting() {
         let text = buffer_text(&render(&[], None, true));
         assert!(text.contains("Starting"), "{text}");
+    }
+
+    #[test]
+    fn paused_state_in_header() {
+        let s = vec!["Alpha.".to_string()];
+        let playing = buffer_text(&render_status(&s, Some(0), true, false));
+        assert!(playing.contains("reading"), "{playing}");
+        let paused = buffer_text(&render_status(&s, Some(0), true, true));
+        assert!(paused.contains("paused"), "{paused}");
     }
 }

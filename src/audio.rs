@@ -68,6 +68,11 @@ struct Shared {
     /// underrun monitor tell a genuine "feeder fell behind" from an expected gap
     /// where synthesis/Ollama simply hasn't produced the next sentence yet.
     feeder_waiting: AtomicBool,
+    /// Pause gate (§5.3): when set, the callback writes silence and does **not**
+    /// drain the ring or advance `samples_consumed` — so no buffered audio is
+    /// lost and the highlight does not drift. The feeder back-pressures and parks
+    /// on its own (the ring fills). Resume is instant; the device stays open.
+    paused: AtomicBool,
 }
 
 /// Maps a cumulative interleaved-sample offset to the sentence index whose audio
@@ -126,6 +131,7 @@ impl Spine {
             consumer_dead: AtomicBool::new(false),
             feeder_done: AtomicBool::new(false),
             feeder_waiting: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
         });
 
         let stream = match device_cfg {
@@ -209,6 +215,16 @@ impl Spine {
     /// Underrun count in per-channel frames (for a status line).
     pub fn underruns(&self) -> u64 {
         self.shared.underruns.load(Relaxed) / self.channels.max(1) as u64
+    }
+
+    /// Pause or resume playback (§5.3). The device stays open; resume is instant.
+    pub fn set_paused(&self, paused: bool) {
+        self.shared.paused.store(paused, Relaxed);
+    }
+
+    /// Whether playback is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.shared.paused.load(Relaxed)
     }
 
     /// Stop playback immediately: drop the output stream (quiescing the callback)
@@ -347,7 +363,10 @@ fn build_and_play(
 ) -> Result<cpal::Stream> {
     let cb = Arc::clone(shared);
     let data_cb = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        if !cb.started.load(Relaxed) {
+        // Silent until prebuffered, and while paused — in both cases without
+        // draining the ring or advancing the consumed counter (RT-safe: a
+        // relaxed load + a branch).
+        if !cb.started.load(Relaxed) || cb.paused.load(Relaxed) {
             data.iter_mut().for_each(|s| *s = 0.0);
             return;
         }
