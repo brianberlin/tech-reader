@@ -57,6 +57,14 @@ impl PcmCache {
         self.map.len()
     }
 
+    /// Drop everything. Used on a speed change — cached PCM is valid only for the
+    /// `length_scale` it was synthesized at, so a new speed starts fresh (§6.4).
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
     /// Look up `key`; on a hit, mark it most-recently-used and return a cheap
     /// `Arc` clone of its samples.
     pub fn get(&mut self, key: &str) -> Option<Arc<[f32]>> {

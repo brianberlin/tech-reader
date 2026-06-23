@@ -26,14 +26,18 @@ pub struct SynthPcm {
     pub samples: Arc<[f32]>,
     /// The voice's native output sample rate (Hz). Never assume 22050.
     pub sample_rate: u32,
+    /// Transport generation this PCM belongs to. The feeder discards any PCM
+    /// from an older generation (synthesized before a seek/speed change).
+    pub generation: u64,
 }
 
 impl SynthPcm {
-    pub fn new(sentence_index: usize, samples: Arc<[f32]>, sample_rate: u32) -> Self {
+    pub fn new(sentence_index: usize, samples: Arc<[f32]>, sample_rate: u32, generation: u64) -> Self {
         Self {
             sentence_index,
             samples,
             sample_rate,
+            generation,
         }
     }
 
@@ -41,11 +45,12 @@ impl SynthPcm {
     /// inter-sentence silence for it, so the sentence index stays aligned with
     /// the audio downstream (§5.4 — "emits a short silence so the index stays
     /// aligned").
-    pub fn silence(sentence_index: usize, sample_rate: u32) -> Self {
+    pub fn silence(sentence_index: usize, sample_rate: u32, generation: u64) -> Self {
         Self {
             sentence_index,
             samples: Arc::from(Vec::new()),
             sample_rate,
+            generation,
         }
     }
 }
@@ -106,7 +111,14 @@ impl Synthesizer {
     /// `sid` selects the speaker (0 for single-speaker voices). `speed` is the
     /// pitch-preserving pace multiplier (>1 faster) — it re-times the VITS
     /// durations, so it cannot be applied to already-rendered audio.
-    pub fn synthesize(&self, index: usize, text: &str, sid: i32, speed: f32) -> Result<SynthPcm> {
+    pub fn synthesize(
+        &self,
+        index: usize,
+        text: &str,
+        sid: i32,
+        speed: f32,
+        generation: u64,
+    ) -> Result<SynthPcm> {
         let cfg = GenerationConfig {
             sid,
             speed,
@@ -124,6 +136,7 @@ impl Synthesizer {
             // once into an owned, shareable allocation.
             samples: Arc::from(audio.samples()),
             sample_rate: audio.sample_rate() as u32,
+            generation,
         })
     }
 }

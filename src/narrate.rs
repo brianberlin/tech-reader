@@ -4,13 +4,37 @@
 //! TS `narrator.ts` + `prompts.ts`.
 
 use std::collections::HashMap;
-use std::sync::mpsc::SyncSender;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::humanize::{humanize_code, humanize_prose};
 use crate::ollama::{is_available, stream_chat, OllamaConfig, OllamaErrorCode};
 use crate::sentence::{split_sentences, SentenceStreamer};
 use crate::types::{Block, BlockKind, Sentence};
+
+/// Where the narrator pushes finished sentences: it appends to the shared list
+/// the synth worker reads by index (enabling random-access seek), and reports
+/// cancellation so narration stops promptly on quit.
+pub struct Emitter {
+    sentences: Arc<Mutex<Vec<String>>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Emitter {
+    pub fn new(sentences: Arc<Mutex<Vec<String>>>, cancel: Arc<AtomicBool>) -> Self {
+        Self { sentences, cancel }
+    }
+
+    /// Append a sentence. Returns false if narration should stop (cancelled).
+    pub fn emit(&self, text: String) -> bool {
+        if self.cancel.load(Relaxed) {
+            return false;
+        }
+        self.sentences.lock().unwrap().push(text);
+        true
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum TableMode {
@@ -154,14 +178,14 @@ fn table_to_speech(source: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Walk blocks, streaming each through Ollama (or humanizing it offline) and
-/// pushing complete sentences onto `tx` as they form. Stops early if the
-/// receiver is gone (teardown).
+/// appending complete sentences via `emit` as they form. Stops early if `emit`
+/// reports cancellation (teardown).
 pub async fn stream_narration(
     blocks: &[Block],
     settings: &NarrationSettings,
     cfg: &OllamaConfig,
     locale: &str,
-    tx: SyncSender<String>,
+    emit: &Emitter,
 ) {
     let dict: HashMap<String, String> = HashMap::new();
     let mut use_ai = is_available(&cfg.base_url, Duration::from_millis(2000)).await;
@@ -177,7 +201,7 @@ pub async fn stream_narration(
     for block in blocks {
         // Headings are tiny — humanize them directly rather than spend a call.
         if block.kind == BlockKind::Heading {
-            if !send_humanized(block, settings, locale, &dict, &tx) {
+            if !send_humanized(block, settings, locale, &dict, emit) {
                 return;
             }
             continue;
@@ -197,7 +221,7 @@ pub async fn stream_narration(
             _ => !use_ai,
         };
         if force_humanize {
-            if !send_humanized(block, settings, locale, &dict, &tx) {
+            if !send_humanized(block, settings, locale, &dict, emit) {
                 return;
             }
             continue;
@@ -208,14 +232,14 @@ pub async fn stream_narration(
             BlockKind::Table => PromptKind::Table,
             _ => PromptKind::Prose,
         };
-        match stream_block(cfg, block, kind, locale, &tx).await {
+        match stream_block(cfg, block, kind, locale, emit).await {
             StreamOutcome::Stop => return,
             StreamOutcome::Ok => {}
             StreamOutcome::Fallback { emitted } => {
                 use_ai = false;
                 // Don't re-narrate a block that already streamed partial output,
                 // or the listener hears the first half twice.
-                if emitted == 0 && !send_humanized(block, settings, locale, &dict, &tx) {
+                if emitted == 0 && !send_humanized(block, settings, locale, &dict, emit) {
                     return;
                 }
             }
@@ -235,7 +259,7 @@ async fn stream_block(
     block: &Block,
     kind: PromptKind,
     locale: &str,
-    tx: &SyncSender<String>,
+    emit: &Emitter,
 ) -> StreamOutcome {
     let mut streamer = SentenceStreamer::new(locale);
     let mut emitted = 0usize;
@@ -253,7 +277,7 @@ async fn stream_block(
                 if s.trim().is_empty() {
                     continue;
                 }
-                if tx.send(s).is_err() {
+                if !emit.emit(s) {
                     stopped = true;
                     return;
                 }
@@ -272,7 +296,7 @@ async fn stream_block(
                 if s.trim().is_empty() {
                     continue;
                 }
-                if tx.send(s).is_err() {
+                if !emit.emit(s) {
                     return StreamOutcome::Stop;
                 }
                 emitted += 1;
@@ -297,14 +321,14 @@ fn send_humanized(
     settings: &NarrationSettings,
     locale: &str,
     dict: &HashMap<String, String>,
-    tx: &SyncSender<String>,
+    emit: &Emitter,
 ) -> bool {
     if let Some(text) = humanize_block_text(block, settings, dict) {
         for s in split_sentences(&text, locale) {
             if s.trim().is_empty() {
                 continue;
             }
-            if tx.send(s).is_err() {
+            if !emit.emit(s) {
                 return false;
             }
         }

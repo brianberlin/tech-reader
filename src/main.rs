@@ -15,6 +15,7 @@ mod humanize;
 mod narrate;
 mod ollama;
 mod sentence;
+mod transport;
 mod tts;
 mod tui;
 mod types;
@@ -24,7 +25,7 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,8 +34,9 @@ use anyhow::{anyhow, Context, Result};
 
 use audio::{Report, Spine, SpineConfig};
 use cache::{normalize, PcmCache};
-use narrate::{stream_narration, NarrationSettings};
+use narrate::{stream_narration, Emitter, NarrationSettings};
 use ollama::OllamaConfig;
+use transport::Transport;
 use tts::{SynthPcm, Synthesizer};
 
 /// Narrated when no file is given.
@@ -182,6 +184,16 @@ fn cache_cap_bytes() -> usize {
         .saturating_mul(1024 * 1024)
 }
 
+/// Initial speed multiplier from `TECH_READER_SPEED` (default 1.0), clamped to a
+/// sane range so a typo can't produce a degenerate render.
+fn initial_speed() -> f32 {
+    std::env::var("TECH_READER_SPEED")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .map(|s| s.clamp(0.5, 2.0))
+        .unwrap_or(1.0)
+}
+
 /// Debug hook: comma-separated sentence indices to force a synthesis failure on,
 /// for exercising the §5.4 skip/abort paths (e.g. `TECH_READER_FAIL_SENTENCE=2`).
 fn parse_fail_set() -> HashSet<usize> {
@@ -250,12 +262,26 @@ fn run() -> std::result::Result<(), AppError> {
     let cfg = OllamaConfig::new(args.ollama_url.clone(), args.model.clone());
     let settings = NarrationSettings::default();
 
-    // Sentence look-ahead (bounded 16): the narrator blocks when the consumer
-    // falls behind — back-pressure all the way to Ollama.
-    let (sent_tx, sent_rx) = sync_channel::<String>(16);
+    // Shared narration list the synth worker reads *by index* (enabling
+    // random-access seek) and the TUI renders. `cancel` lets a TUI quit stop the
+    // narrator promptly and the synth worker leave FFI before teardown.
+    // `narrator_done` / `synth_idle` are completion signals.
+    let sentences: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let narrator_done = Arc::new(AtomicBool::new(false));
+    let synth_idle = Arc::new(AtomicBool::new(false));
 
-    // Narrator runs on its own OS thread with a current-thread tokio runtime
-    // (the only async work is the Ollama HTTP stream).
+    // Transport (seek/speed) shared with the spine, synth worker, and TUI.
+    // TECH_READER_SPEED sets the initial speed (mainly so headless renders can be
+    // compared across speeds; the TUI ladder is the normal control).
+    let transport = Arc::new(Transport::new(initial_speed()));
+
+    // Narrator runs on its own OS thread with a current-thread tokio runtime (the
+    // only async work is the Ollama HTTP stream). It appends finished sentences
+    // to the shared list — no back-pressure channel, since text is cheap and a
+    // fully-narrated document is what makes forward scroll + seek possible.
+    let emitter = Emitter::new(Arc::clone(&sentences), Arc::clone(&cancel));
+    let narrator_flag = Arc::clone(&narrator_done);
     let narrator = thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -264,18 +290,16 @@ fn run() -> std::result::Result<(), AppError> {
             Ok(rt) => rt,
             Err(e) => {
                 crate::diag!("[narrate] could not start runtime: {e}");
+                narrator_flag.store(true, Ordering::Release);
                 return;
             }
         };
-        rt.block_on(stream_narration(&document, &settings, &cfg, "en", sent_tx));
+        rt.block_on(stream_narration(&document, &settings, &cfg, "en", &emitter));
+        narrator_flag.store(true, Ordering::Release);
     });
 
     if args.text_only {
-        let mut i = 0;
-        while let Ok(t) = sent_rx.recv() {
-            println!("{i:>3}  {t}");
-            i += 1;
-        }
+        print_narrated(&sentences, &narrator_done);
         let _ = narrator.join();
         return Ok(());
     }
@@ -297,82 +321,107 @@ fn run() -> std::result::Result<(), AppError> {
 
     let cap_bytes = cache_cap_bytes();
     let fail_set = parse_fail_set();
-    let length_scale = 1.0f32; // base pace; the speed ladder lands in M5
-    let speed = 1.0f32;
-
-    // The narration list the TUI renders. The synth worker appends each sentence
-    // as it receives it, at the same index the boundary table uses — so the
-    // audible-sentence highlight indexes straight into this Vec.
-    let sentences: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let synth_sentences = Arc::clone(&sentences);
-
-    // Cancellation for a clean TUI quit: the synth worker polls it so it leaves
-    // sherpa-onnx FFI before we tear down (abandoning a thread mid-FFI crashes on
-    // exit when onnxruntime runs its static destructors).
-    let cancel = Arc::new(AtomicBool::new(false));
-    let synth_cancel = Arc::clone(&cancel);
 
     // Look-ahead: 2 sentences of synthesized PCM. The bounded send is the
     // primary back-pressure valve (the synth worker parks when it's full).
     let (pcm_tx, pcm_rx) = sync_channel::<SynthPcm>(2);
-    let mut spine = Spine::start(pcm_rx, SpineConfig::default(), PathBuf::from("out/narration.wav"))
-        .map_err(|e| AppError::new(exit::DEVICE, e))?;
+    let mut spine = Spine::start(
+        pcm_rx,
+        SpineConfig::default(),
+        PathBuf::from("out/narration.wav"),
+        Arc::clone(&transport),
+    )
+    .map_err(|e| AppError::new(exit::DEVICE, e))?;
 
-    // Synth worker: pulls sentence texts, records them for display, serves them
-    // from the PCM cache or synthesizes ahead into the bounded PCM channel,
-    // skipping (with aligned silence) on failure and aborting after too many.
-    let synth = thread::spawn(move || -> Result<()> {
-        let engine = Synthesizer::new_vits(&model, &tokens, &data_dir, length_scale)
-            .context("failed to create synthesizer")?;
-        let rate = engine.sample_rate();
-        crate::diag!("[synth] voice sample rate: {rate} Hz");
+    // The TUI runs only with a real terminal AND a live output stream (else the
+    // highlight could never advance). That also decides whether the synth worker
+    // idles when done (TUI, awaiting a seek) or exits (headless, so the feeder
+    // ends and the drain wait completes).
+    let interactive = want_tui && spine.has_output_stream();
 
-        let mut cache = PcmCache::new(cap_bytes);
-        let mut i = 0usize;
-        let mut consecutive = 0u32;
-        loop {
-            if synth_cancel.load(Ordering::Relaxed) {
-                break;
+    // Synth worker: cursor-based. Reads sentence text by index, reacting to
+    // seek/speed changes (reseat the cursor; clear the cache on a speed change),
+    // serves from the PCM cache or synthesizes into the bounded PCM channel, and
+    // skips (with aligned silence) on failure, aborting after too many in a row.
+    let synth = thread::spawn({
+        let sentences = Arc::clone(&sentences);
+        let cancel = Arc::clone(&cancel);
+        let transport = Arc::clone(&transport);
+        let narrator_done = Arc::clone(&narrator_done);
+        let synth_idle = Arc::clone(&synth_idle);
+        move || -> Result<()> {
+            let engine = Synthesizer::new_vits(&model, &tokens, &data_dir, 1.0)
+                .context("failed to create synthesizer")?;
+            let rate = engine.sample_rate();
+            crate::diag!("[synth] voice sample rate: {rate} Hz");
+
+            let mut cache = PcmCache::new(cap_bytes);
+            let mut cursor = 0usize;
+            let mut cur_gen = transport.generation();
+            let mut active_speed = transport.speed();
+            let mut consecutive = 0u32;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                // React to a seek/speed change.
+                let g = transport.generation();
+                if g != cur_gen {
+                    cur_gen = g;
+                    cursor = transport.seek_target();
+                    let s = transport.speed();
+                    if s != active_speed {
+                        active_speed = s;
+                        cache.clear(); // the cache only holds the active speed (§6.4)
+                    }
+                }
+
+                let len = sentences.lock().unwrap().len();
+                if cursor >= len {
+                    if narrator_done.load(Ordering::Acquire) {
+                        synth_idle.store(true, Ordering::Relaxed);
+                        if !interactive {
+                            break; // headless: nothing more to produce
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                synth_idle.store(false, Ordering::Relaxed);
+
+                let text = sentences.lock().unwrap()[cursor].clone();
+                let pcm = match synth_one(
+                    &engine, &mut cache, &fail_set, cursor, &text, rate, active_speed, g,
+                    &mut consecutive,
+                )? {
+                    Some(p) => p,
+                    None => SynthPcm::silence(cursor, rate, g),
+                };
+                match send_pcm(&pcm_tx, pcm, &cancel, &transport, g) {
+                    SendResult::Sent => cursor += 1,
+                    SendResult::Superseded => {} // a seek arrived; loop to reseat
+                    SendResult::Stop => break,
+                }
             }
-            let text = match sent_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(t) => t,
-                Err(RecvTimeoutError::Timeout) => continue, // re-check cancel
-                Err(RecvTimeoutError::Disconnected) => break, // narrator done
-            };
-            // Record at index i (== the SynthPcm/boundary index) before synth.
-            synth_sentences.lock().unwrap().push(text.clone());
-            let pcm = match synth_one(
-                &engine,
-                &mut cache,
-                &fail_set,
-                i,
-                &text,
-                rate,
-                speed,
-                &mut consecutive,
-            )? {
-                Some(p) => p,
-                None => SynthPcm::silence(i, rate),
-            };
-            if pcm_tx.send(pcm).is_err() {
-                break; // feeder gone
-            }
-            i += 1;
+            crate::diag!(
+                "[synth] cache: {} entries, {} KB",
+                cache.len(),
+                cache.len_bytes() / 1024
+            );
+            Ok(())
         }
-        crate::diag!(
-            "[synth] cache: {} entries, {} KB",
-            cache.len(),
-            cache.len_bytes() / 1024
-        );
-        Ok(())
     });
 
-    // TUI path: only with a live output stream (otherwise the highlight could
-    // never advance). On quit, tear down cleanly (§5.3): signal cancel, stop the
-    // stream, join the synth worker so it is out of FFI, then join the feeder.
-    // The narrator (pure-Rust HTTP) is left for the OS to reap on exit.
-    if want_tui && spine.has_output_stream() {
-        let res = tui::run(Arc::clone(&sentences), &spine);
+    // TUI path: drive until quit, then tear down cleanly (§5.3) — cancel, stop
+    // the stream, join the synth (so it is out of FFI), join the feeder. The
+    // narrator (pure-Rust HTTP) is left for the OS to reap on exit.
+    if interactive {
+        let res = tui::run(
+            Arc::clone(&sentences),
+            &spine,
+            Arc::clone(&transport),
+            Arc::clone(&synth_idle),
+        );
         cancel.store(true, Ordering::Relaxed);
         spine.stop_audio();
         let _ = synth.join();
@@ -386,6 +435,7 @@ fn run() -> std::result::Result<(), AppError> {
     }
     let started = Instant::now();
     spine.wait_until_drained(Duration::from_secs(3600));
+    cancel.store(true, Ordering::Relaxed); // release the synth worker if it idles
     let _ = narrator.join();
     let synth_result = synth.join();
 
@@ -401,6 +451,60 @@ fn run() -> std::result::Result<(), AppError> {
     }
 }
 
+/// `--text` mode: print sentences to stdout as the narrator produces them.
+fn print_narrated(sentences: &Mutex<Vec<String>>, narrator_done: &AtomicBool) {
+    let mut printed = 0usize;
+    loop {
+        let len = sentences.lock().unwrap().len();
+        while printed < len {
+            let t = sentences.lock().unwrap()[printed].clone();
+            println!("{printed:>3}  {t}");
+            printed += 1;
+        }
+        if narrator_done.load(Ordering::Acquire) && printed >= sentences.lock().unwrap().len() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Outcome of trying to hand a freshly-synthesized PCM to the feeder.
+enum SendResult {
+    Sent,
+    /// A newer seek/speed change arrived while blocked — drop this stale PCM.
+    Superseded,
+    /// Cancelled, or the feeder is gone.
+    Stop,
+}
+
+/// Send `pcm` to the feeder, blocking when the look-ahead is full but staying
+/// responsive to cancel and to a newer seek (so a held-up stale PCM is dropped
+/// rather than delaying the seek).
+fn send_pcm(
+    tx: &SyncSender<SynthPcm>,
+    mut pcm: SynthPcm,
+    cancel: &AtomicBool,
+    transport: &Transport,
+    generation: u64,
+) -> SendResult {
+    loop {
+        match tx.try_send(pcm) {
+            Ok(()) => return SendResult::Sent,
+            Err(TrySendError::Full(p)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return SendResult::Stop;
+                }
+                if transport.generation() != generation {
+                    return SendResult::Superseded;
+                }
+                pcm = p;
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(TrySendError::Disconnected(_)) => return SendResult::Stop,
+        }
+    }
+}
+
 /// Resolve one sentence to PCM. Returns `Ok(Some)` on a cache hit or fresh
 /// synthesis, `Ok(None)` to signal "skip with aligned silence", and `Err` only
 /// to abort after `MAX_CONSECUTIVE_SYNTH_FAILURES` failures in a row.
@@ -413,6 +517,7 @@ fn synth_one(
     text: &str,
     rate: u32,
     speed: f32,
+    generation: u64,
     consecutive: &mut u32,
 ) -> Result<Option<SynthPcm>> {
     if fail_set.contains(&index) {
@@ -423,10 +528,10 @@ fn synth_one(
     let key = normalize(text);
     if let Some(samples) = cache.get(&key) {
         *consecutive = 0;
-        return Ok(Some(SynthPcm::new(index, samples, rate)));
+        return Ok(Some(SynthPcm::new(index, samples, rate, generation)));
     }
 
-    match engine.synthesize(index, text, 0, speed) {
+    match engine.synthesize(index, text, 0, speed, generation) {
         Ok(pcm) => {
             *consecutive = 0;
             cache.insert(key, Arc::clone(&pcm.samples));

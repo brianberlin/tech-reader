@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use crate::transport::Transport;
 use crate::tts::SynthPcm;
 use crate::wav;
 
@@ -111,7 +112,12 @@ impl Spine {
     /// If no usable audio output is available (any step fails — no device, bad
     /// format, build/play error), degrade to **WAV-only** rendering so narration
     /// always completes; on a real session with a working device it plays live.
-    pub fn start(pcm_rx: Receiver<SynthPcm>, cfg: SpineConfig, wav_path: PathBuf) -> Result<Spine> {
+    pub fn start(
+        pcm_rx: Receiver<SynthPcm>,
+        cfg: SpineConfig,
+        wav_path: PathBuf,
+        transport: Arc<Transport>,
+    ) -> Result<Spine> {
         // Query the device config first so the ring can be sized to its rate.
         let device_cfg = try_open_device();
         let (device_rate, channels) = match &device_cfg {
@@ -135,14 +141,18 @@ impl Spine {
         });
 
         let stream = match device_cfg {
-            Ok((device, config, _, _)) => match build_and_play(&device, config, &shared, consumer) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    crate::diag!("[spine] could not start audio output ({e}); rendering to WAV only.");
-                    mark_no_device(&shared);
-                    None
+            Ok((device, config, _, _)) => {
+                match build_and_play(&device, config, &shared, &transport, consumer) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        crate::diag!(
+                            "[spine] could not start audio output ({e}); rendering to WAV only."
+                        );
+                        mark_no_device(&shared);
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 crate::diag!("[spine] no usable audio output ({e}); rendering to WAV only.");
                 drop(consumer);
@@ -156,16 +166,19 @@ impl Spine {
         let feeder_shared = Arc::clone(&shared);
         let feed_wav = wav_path.clone();
         let feed_bounds = Arc::clone(&boundaries);
+        let feed_transport = Arc::clone(&transport);
         let feeder = thread::spawn(move || {
             feed(
                 pcm_rx,
                 producer,
                 device_rate,
                 channels,
+                ring_capacity,
                 cfg,
                 feeder_shared,
                 feed_wav,
                 feed_bounds,
+                feed_transport,
             )
         });
 
@@ -198,10 +211,12 @@ impl Spine {
         self.shared.consumer_dead.load(Relaxed)
     }
 
-    /// All input has been fed and every pushed sample has been played out.
-    pub fn is_finished(&self) -> bool {
-        self.shared.feeder_done.load(Relaxed)
-            && self.shared.samples_consumed.load(Relaxed) >= self.shared.samples_pushed.load(Relaxed)
+    /// Every pushed sample has been played out (something was pushed). Used by the
+    /// TUI, where the synth thread stays alive for seek so `feeder_done` never
+    /// fires; combine with the synth-idle flag for a "done" status.
+    pub fn is_drained(&self) -> bool {
+        let pushed = self.shared.samples_pushed.load(Relaxed);
+        pushed > 0 && self.shared.samples_consumed.load(Relaxed) >= pushed
     }
 
     /// The sentence index currently audible, from frames consumed by the callback
@@ -359,15 +374,31 @@ fn build_and_play(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     shared: &Arc<Shared>,
+    transport: &Arc<Transport>,
     mut consumer: rtrb::Consumer<f32>,
 ) -> Result<cpal::Stream> {
     let cb = Arc::clone(shared);
+    let tp = Arc::clone(transport);
+    let mut cb_gen = tp.generation();
+    let mut last_out = 0.0f32; // last sample written, for the seek de-click
     let data_cb = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        // Seek/speed flush (§5.3): on a generation change, drain the now-stale
+        // ring, reset the consumed counter, and ramp from the last output down
+        // to silence so the cut is click-free. Bounded loop, no alloc/lock.
+        let g = tp.generation();
+        if g != cb_gen {
+            cb_gen = g;
+            while consumer.pop().is_ok() {}
+            cb.samples_consumed.store(0, Relaxed);
+            declick_to_silence(data, &mut last_out);
+            return;
+        }
         // Silent until prebuffered, and while paused — in both cases without
         // draining the ring or advancing the consumed counter (RT-safe: a
         // relaxed load + a branch).
         if !cb.started.load(Relaxed) || cb.paused.load(Relaxed) {
             data.iter_mut().for_each(|s| *s = 0.0);
+            last_out = 0.0;
             return;
         }
         let mut consumed = 0u64;
@@ -384,6 +415,7 @@ fn build_and_play(
                 }
             }
         }
+        last_out = *data.last().unwrap_or(&0.0);
         if consumed > 0 {
             cb.samples_consumed.fetch_add(consumed, Relaxed);
         }
@@ -414,10 +446,12 @@ fn feed(
     mut producer: rtrb::Producer<f32>,
     device_rate: u32,
     channels: u16,
+    ring_capacity: usize,
     cfg: SpineConfig,
     shared: Arc<Shared>,
     wav_path: PathBuf,
     boundaries: Boundaries,
+    transport: Arc<Transport>,
 ) {
     let silence_frames = (device_rate as u64 * cfg.silence_ms as u64 / 1000) as usize;
     let ramp_frames = (device_rate as u64 * cfg.ramp_ms as u64 / 1000).max(1) as usize;
@@ -438,15 +472,41 @@ fn feed(
     };
 
     let trim_margin = (device_rate as usize * 10 / 1000).max(1); // ~10 ms keepout
-    let mut cumulative: u64 = 0; // interleaved samples pushed so far
+    let mut cumulative: u64 = 0; // interleaved samples pushed so far (this generation)
+    let mut feed_gen = transport.generation();
 
     loop {
         shared.feeder_waiting.store(true, Relaxed);
-        let pcm = match pcm_rx.recv() {
-            Ok(p) => p,
-            Err(_) => break, // all senders gone
-        };
+        let got = pcm_rx.recv_timeout(Duration::from_millis(50));
         shared.feeder_waiting.store(false, Relaxed);
+
+        // Seek/speed flush (§5.3): when the generation advances, wait for the
+        // callback to drain the now-stale ring, then reset our offset, boundary
+        // table, and pushed counter so the new sequence starts clean from 0.
+        let g = transport.generation();
+        if g != feed_gen {
+            feed_gen = g;
+            let t0 = Instant::now();
+            while producer.slots() < ring_capacity
+                && !shared.consumer_dead.load(Relaxed)
+                && t0.elapsed() < Duration::from_millis(250)
+            {
+                thread::sleep(Duration::from_micros(200));
+            }
+            cumulative = 0;
+            boundaries.lock().unwrap().clear();
+            shared.samples_pushed.store(0, Relaxed);
+        }
+
+        let pcm = match got {
+            Ok(p) => p,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // all senders gone
+        };
+        // Discard PCM synthesized before the latest seek/speed change.
+        if pcm.generation != g {
+            continue;
+        }
 
         // Record where this sentence's audio begins so the TUI can map the
         // callback's consumed-sample count back to a sentence index.
@@ -626,6 +686,21 @@ fn apply_ramp(mono: &mut [f32], ramp: usize) {
         mono[i] *= g;
         mono[n - 1 - i] *= g;
     }
+}
+
+/// Fill `data` with a short linear ramp from `*last_out` down to 0, then silence
+/// — a click-free cut for a seek/speed flush. Updates `*last_out` to 0.
+fn declick_to_silence(data: &mut [f32], last_out: &mut f32) {
+    let ramp = data.len().min(64);
+    let start = *last_out;
+    for (i, s) in data.iter_mut().enumerate() {
+        *s = if i < ramp {
+            start * (1.0 - i as f32 / ramp as f32)
+        } else {
+            0.0
+        };
+    }
+    *last_out = 0.0;
 }
 
 /// Resolve a consumed interleaved-sample offset to the sentence playing there:

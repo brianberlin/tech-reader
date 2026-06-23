@@ -11,6 +11,7 @@
 //! loop, the audible-sentence highlight, scroll-follow, and quit/teardown.
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,30 +28,44 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::audio::Spine;
+use crate::transport::Transport;
 
 type Backend = CrosstermBackend<Stdout>;
 
-/// Status shown in the header, computed once per frame from the spine.
+/// Discrete speed steps mapping to a pitch-preserving multiplier (§6.4). The
+/// default is 1.0× (index 1).
+const SPEED_LADDER: &[f32] = &[0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+const DEFAULT_SPEED_STEP: usize = 1;
+
+/// Status shown in the header, computed once per frame.
 struct Status {
     paused: bool,
     finished: bool,
+    speed: f32,
     underruns: u64,
 }
 
-/// Scroll/follow state owned by the loop (not shared).
+/// Scroll/follow/speed state owned by the loop (not shared).
 struct View {
     /// When true, the highlight follows the audible sentence and auto-scrolls.
     follow: bool,
     /// The highlighted row: the audible sentence while following, else the
     /// browse cursor.
     selected: usize,
+    /// Index into `SPEED_LADDER`.
+    speed_step: usize,
 }
 
 /// Run the TUI until the user quits (or the audio device dies). Restores the
 /// terminal before returning, even on error, so later stderr is not swallowed.
-pub fn run(sentences: Arc<Mutex<Vec<String>>>, spine: &Spine) -> io::Result<()> {
+pub fn run(
+    sentences: Arc<Mutex<Vec<String>>>,
+    spine: &Spine,
+    transport: Arc<Transport>,
+    synth_idle: Arc<AtomicBool>,
+) -> io::Result<()> {
     let mut terminal = setup()?;
-    let res = event_loop(&mut terminal, &sentences, spine);
+    let res = event_loop(&mut terminal, &sentences, spine, &transport, &synth_idle);
     restore(&mut terminal);
     res
 }
@@ -80,10 +95,13 @@ fn event_loop(
     terminal: &mut Terminal<Backend>,
     sentences: &Arc<Mutex<Vec<String>>>,
     spine: &Spine,
+    transport: &Transport,
+    synth_idle: &AtomicBool,
 ) -> io::Result<()> {
     let mut view = View {
         follow: true,
         selected: 0,
+        speed_step: DEFAULT_SPEED_STEP,
     };
 
     loop {
@@ -92,7 +110,10 @@ fn event_loop(
         let current = spine.current_sentence();
         let status = Status {
             paused: spine.is_paused(),
-            finished: spine.is_finished(),
+            // The synth thread stays alive for seek, so "done" = it has nothing
+            // left to produce and every pushed sample has played.
+            finished: synth_idle.load(Ordering::Relaxed) && spine.is_drained(),
+            speed: SPEED_LADDER[view.speed_step],
             underruns: spine.underruns(),
         };
 
@@ -118,13 +139,25 @@ fn event_loop(
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    // The transport position to act from: the audible sentence,
+                    // or the browse cursor before playback has started.
+                    let pos = current.unwrap_or(view.selected);
+                    let total = sentences.lock().unwrap().len();
                     match key.code {
-                        // Pause/resume needs the spine; everything else is view-only.
                         KeyCode::Char(' ') | KeyCode::Char('p') => {
                             spine.set_paused(!spine.is_paused());
                         }
+                        KeyCode::Left => seek(transport, &mut view, pos.saturating_sub(1)),
+                        KeyCode::Right => {
+                            seek(transport, &mut view, (pos + 1).min(total.saturating_sub(1)))
+                        }
+                        KeyCode::Char('-') | KeyCode::Char('_') => {
+                            change_speed(transport, &mut view, pos, -1)
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            change_speed(transport, &mut view, pos, 1)
+                        }
                         _ => {
-                            let total = sentences.lock().unwrap().len();
                             if handle_key(key, &mut view, total) {
                                 break; // quit
                             }
@@ -137,7 +170,25 @@ fn event_loop(
     Ok(())
 }
 
-/// Apply a key. Returns true to quit.
+/// Jump playback to `target` and snap the highlight there immediately (follow
+/// keeps it pinned as the audio catches up).
+fn seek(transport: &Transport, view: &mut View, target: usize) {
+    transport.seek_to(target);
+    view.selected = target;
+    view.follow = true;
+}
+
+/// Step the speed by `delta` along the ladder and resume at `current`.
+fn change_speed(transport: &Transport, view: &mut View, current: usize, delta: isize) {
+    let last = SPEED_LADDER.len() - 1;
+    let step = (view.speed_step as isize + delta).clamp(0, last as isize) as usize;
+    if step != view.speed_step {
+        view.speed_step = step;
+        transport.set_speed(SPEED_LADDER[step], current);
+    }
+}
+
+/// Apply a scroll/quit key. Returns true to quit.
 fn handle_key(key: KeyEvent, view: &mut View, total: usize) -> bool {
     let last = total.saturating_sub(1);
     match key.code {
@@ -236,6 +287,10 @@ fn header(total: usize, current: Option<usize>, follow: bool, status: &Status) -
         state,
         Span::raw(format!("   {pos}/{total}")),
         Span::styled(
+            format!("   {}", fmt_speed(status.speed)),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(
             if follow { "   ⟳ follow" } else { "   ‖ browsing" },
             Style::default().fg(Color::DarkGray),
         ),
@@ -249,11 +304,18 @@ fn header(total: usize, current: Option<usize>, follow: bool, status: &Status) -
     Paragraph::new(Line::from(spans))
 }
 
+/// Format a speed multiplier compactly: 1.0 -> "1×", 1.25 -> "1.25×".
+fn fmt_speed(speed: f32) -> String {
+    let s = format!("{speed:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    format!("{s}×")
+}
+
 fn footer(follow: bool) -> Paragraph<'static> {
     let hint = if follow {
-        "space pause · ↑/↓ scroll · q quit"
+        "space pause · ←/→ seek · −/+ speed · ↑/↓ scroll · q quit"
     } else {
-        "space pause · ↑/↓ scroll · f follow · q quit"
+        "space pause · ←/→ seek · −/+ speed · ↑/↓ scroll · f follow · q quit"
     };
     Paragraph::new(Line::from(Span::styled(
         hint,
@@ -310,14 +372,16 @@ mod tests {
         follow: bool,
         paused: bool,
     ) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let view = View {
             follow,
             selected: current.unwrap_or(0),
+            speed_step: DEFAULT_SPEED_STEP,
         };
         let status = Status {
             paused,
             finished: false,
+            speed: SPEED_LADDER[DEFAULT_SPEED_STEP],
             underruns: 0,
         };
         terminal
@@ -390,5 +454,52 @@ mod tests {
         assert!(playing.contains("reading"), "{playing}");
         let paused = buffer_text(&render_status(&s, Some(0), true, true));
         assert!(paused.contains("paused"), "{paused}");
+    }
+
+    #[test]
+    fn speed_label_formats() {
+        assert_eq!(fmt_speed(1.0), "1×");
+        assert_eq!(fmt_speed(1.25), "1.25×");
+        assert_eq!(fmt_speed(0.75), "0.75×");
+        assert_eq!(fmt_speed(1.5), "1.5×");
+    }
+
+    #[test]
+    fn speed_steps_clamp_and_publish() {
+        let t = Transport::new(1.0);
+        let mut v = View {
+            follow: true,
+            selected: 0,
+            speed_step: DEFAULT_SPEED_STEP,
+        };
+        change_speed(&t, &mut v, 3, 1); // 1.0× -> 1.25×, resuming at sentence 3
+        assert_eq!(v.speed_step, 2);
+        assert_eq!(t.speed(), 1.25);
+        assert_eq!(t.seek_target(), 3);
+        for _ in 0..10 {
+            change_speed(&t, &mut v, 0, 1);
+        }
+        assert_eq!(v.speed_step, SPEED_LADDER.len() - 1); // clamps at the top
+        assert_eq!(t.speed(), 2.0);
+        for _ in 0..10 {
+            change_speed(&t, &mut v, 0, -1);
+        }
+        assert_eq!(v.speed_step, 0); // clamps at the bottom
+        assert_eq!(t.speed(), 0.75);
+    }
+
+    #[test]
+    fn seek_snaps_highlight_and_publishes_target() {
+        let t = Transport::new(1.0);
+        let mut v = View {
+            follow: false,
+            selected: 9,
+            speed_step: DEFAULT_SPEED_STEP,
+        };
+        seek(&t, &mut v, 4);
+        assert_eq!(v.selected, 4);
+        assert!(v.follow, "seek re-enables follow so the highlight pins to the target");
+        assert_eq!(t.seek_target(), 4);
+        assert_eq!(t.generation(), 1);
     }
 }
