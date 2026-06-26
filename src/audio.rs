@@ -119,7 +119,10 @@ impl Spine {
         transport: Arc<Transport>,
     ) -> Result<Spine> {
         // Query the device config first so the ring can be sized to its rate.
-        let device_cfg = try_open_device();
+        // CoreAudio/cpal can transiently fail to hand out the default device on
+        // launch (device busy, sample-rate negotiation), so retry a few times
+        // before falling back to WAV-only rendering.
+        let device_cfg = try_open_device_retrying(3, Duration::from_millis(150));
         let (device_rate, channels) = match &device_cfg {
             Ok((_, _, rate, ch)) => (*rate, *ch),
             Err(_) => (44_100, 2), // sane defaults for WAV-only rendering
@@ -252,11 +255,19 @@ impl Spine {
 
     /// Block until the ring is fully drained, or until it's clear no device is
     /// draining it (headless) — in which case the feeder is told to stop pushing
-    /// so it can finish teeing the WAV.
-    pub fn wait_until_drained(&self, max: Duration) {
+    /// so it can finish teeing the WAV. Also returns early when `interrupted` is
+    /// set (a SIGINT/SIGTERM/SIGHUP arrived), declaring the consumer dead so the
+    /// feeder stops and `finish()` can drop the stream and tee what it has.
+    pub fn wait_until_drained(&self, max: Duration, interrupted: &AtomicBool) {
         let start = Instant::now();
         // 60 ms of audio: "the device clearly pulled real samples".
         let min_live = (self.device_rate as u64 * self.channels as u64 * 60 / 1000).max(1);
+        // WAV-only render (no output stream): the callback never runs, so the
+        // device-liveness probe and the pre-set `consumer_dead` flag don't apply
+        // — the only correct exit is "the feeder finished rendering". Honoring
+        // `consumer_dead` here would bail on the first iteration and leave an
+        // empty WAV.
+        let live_device = self.stream.is_some();
 
         let mut started_at: Option<Instant> = None;
         let mut live = false; // latched once the device proves it drains
@@ -268,14 +279,25 @@ impl Spine {
             let pushed = self.shared.samples_pushed.load(Relaxed);
 
             if self.shared.feeder_done.load(Relaxed) && consumed >= pushed {
-                break; // fully drained
+                break; // fully drained (or, in WAV-only mode, fully rendered)
             }
-            if self.shared.consumer_dead.load(Relaxed) {
+            if interrupted.load(Relaxed) {
+                crate::diag!("[spine] interrupted — stopping playback for teardown.");
+                self.shared.consumer_dead.store(true, Relaxed);
                 break;
             }
             if start.elapsed() > max {
                 crate::diag!("[spine] drain wait hit the {}s cap.", max.as_secs());
                 self.shared.consumer_dead.store(true, Relaxed);
+                break;
+            }
+            if !live_device {
+                // No device to drain the ring; just let the feeder tee the whole
+                // WAV, then exit via the feeder_done check above.
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            if self.shared.consumer_dead.load(Relaxed) {
                 break;
             }
 
@@ -349,6 +371,29 @@ impl Spine {
 }
 
 /// Query the default output device and its f32 config (rate, channels).
+/// Open the default output device, retrying a transient failure up to
+/// `attempts` times with `backoff` between tries. The last error is returned if
+/// every attempt fails.
+fn try_open_device_retrying(
+    attempts: u32,
+    backoff: Duration,
+) -> Result<(cpal::Device, cpal::StreamConfig, u32, u16)> {
+    let mut last_err = None;
+    for attempt in 1..=attempts.max(1) {
+        match try_open_device() {
+            Ok(cfg) => return Ok(cfg),
+            Err(e) => {
+                crate::diag!("[spine] open output device attempt {attempt}/{attempts} failed: {e}");
+                last_err = Some(e);
+                if attempt < attempts {
+                    thread::sleep(backoff);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no output device")))
+}
+
 fn try_open_device() -> Result<(cpal::Device, cpal::StreamConfig, u32, u16)> {
     let host = cpal::default_host();
     let device = host
@@ -774,6 +819,64 @@ mod tests {
         for v in resample(&flat, 16000, 44100) {
             assert!((v - 0.5).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn wav_only_render_writes_frames() {
+        // Regression: with no output device, `mark_no_device` pre-sets
+        // `consumer_dead`, and the feeder must still tee every fed sentence to
+        // the WAV (the ring is never drained, but the WAV write precedes the
+        // ring push). Previously `wait_until_drained` bailed on the pre-set flag
+        // before any audio was rendered, leaving an empty WAV.
+        use std::sync::mpsc::sync_channel;
+
+        let wav_path = std::env::temp_dir()
+            .join(format!("tech-reader-test-{}.wav", std::process::id()));
+        let _ = std::fs::remove_file(&wav_path);
+
+        let device_rate = 44_100u32;
+        let channels = 2u16;
+        let ring_capacity = 4096usize;
+        let (producer, _consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity);
+        let shared = Arc::new(Shared {
+            samples_pushed: AtomicU64::new(0),
+            samples_consumed: AtomicU64::new(0),
+            underruns: AtomicU64::new(0),
+            started: AtomicBool::new(false),
+            consumer_dead: AtomicBool::new(false),
+            feeder_done: AtomicBool::new(false),
+            feeder_waiting: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+        });
+        mark_no_device(&shared); // emulate the WAV-only fallback
+        let transport = Arc::new(Transport::new(1.0));
+        let boundaries: Boundaries = Arc::new(Mutex::new(Vec::new()));
+
+        let (tx, rx) = sync_channel::<SynthPcm>(4);
+        // Two short non-silent sentences at the device rate (no resample).
+        let gen = transport.generation();
+        tx.send(SynthPcm::new(0, Arc::from(vec![0.5f32; 2000]), device_rate, gen)).unwrap();
+        tx.send(SynthPcm::new(1, Arc::from(vec![0.3f32; 2000]), device_rate, gen)).unwrap();
+        drop(tx); // disconnect so the feeder loop exits
+
+        feed(
+            rx,
+            producer,
+            device_rate,
+            channels,
+            ring_capacity,
+            SpineConfig::default(),
+            Arc::clone(&shared),
+            wav_path.clone(),
+            boundaries,
+            Arc::clone(&transport),
+        );
+
+        assert!(shared.feeder_done.load(Relaxed), "feeder should finish on disconnect");
+        let len = std::fs::metadata(&wav_path).expect("WAV should exist").len();
+        // A bare WAV header is 44 bytes; real frames make it much larger.
+        assert!(len > 44, "WAV-only render produced no frames (len={len})");
+        let _ = std::fs::remove_file(&wav_path);
     }
 
     #[test]

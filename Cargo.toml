@@ -46,6 +46,13 @@ sha2 = "0.11"          # sha256 verify of downloaded voices
 # --- Errors ---
 anyhow = "1.0"
 thiserror = "2"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+
+# --- Signal handling (clean teardown on SIGINT/SIGTERM/SIGHUP) ---
+# Already present transitively via crossterm's signal-hook-mio; promoted to a
+# direct dep so we can flag-register our own teardown signals. Unix-only.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
 
 [profile.release]
 lto = true

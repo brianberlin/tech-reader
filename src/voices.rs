@@ -37,12 +37,12 @@ pub struct Voice {
 /// 24 kHz, Apache-2.0) is the planned second entry once its archive sha is
 /// pinned — the loader is voice-agnostic, so adding it is data-only.
 pub const CATALOG: &[Voice] = &[Voice {
-    name: "vits-piper-en_US-amy-low",
-    model: "en_US-amy-low.onnx",
+    name: "vits-piper-en_US-ryan-medium",
+    model: "en_US-ryan-medium.onnx",
     tokens: "tokens.txt",
     data_dir: "espeak-ng-data",
-    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-low.tar.bz2",
-    sha256: "c70f5284a09a7fd4ed203b39b2ff51cac1432b422b852eb647b481dade3cf639",
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-ryan-medium.tar.bz2",
+    sha256: "c546af78b6395b4e7c4ce1ed899438b64426a362f5d4ec5fecd090ded9ad7505",
 }];
 
 /// Resolved on-disk paths for a voice's three load artifacts.
@@ -262,8 +262,8 @@ mod tests {
     #[test]
     fn paths_join_under_dir() {
         let v = &CATALOG[0];
-        let p = paths_in(Path::new("/voices/amy"), v);
-        assert!(p.model.ends_with("en_US-amy-low.onnx"));
+        let p = paths_in(Path::new("/voices/ryan"), v);
+        assert!(p.model.ends_with("en_US-ryan-medium.onnx"));
         assert!(p.tokens.ends_with("tokens.txt"));
         assert!(p.data_dir.ends_with("espeak-ng-data"));
         assert!(!p.complete()); // nothing on disk

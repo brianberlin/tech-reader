@@ -233,7 +233,7 @@ pub async fn stream_narration(
             BlockKind::Table => PromptKind::Table,
             _ => PromptKind::Prose,
         };
-        match stream_block(cfg, block, kind, locale, emit).await {
+        match stream_block(cfg, block, kind, locale, &dict, emit).await {
             StreamOutcome::Stop => return,
             StreamOutcome::Ok => {}
             StreamOutcome::Fallback { emitted } => {
@@ -254,12 +254,23 @@ enum StreamOutcome {
     Stop,
 }
 
+/// Make one AI-streamed sentence safe to speak. The prompt asks the model for
+/// plain spoken prose, but models still slip in markdown backticks and code-ish
+/// tokens (`Packing.pack/4`, `"pact"`); fed raw to espeak-ng these garble the
+/// whole utterance. Running the same humanizer the offline path uses strips the
+/// markup and turns identifiers/paths/symbols into spoken words. Plain English
+/// passes through untouched. Returns "" for sentences that humanize to nothing.
+fn speakable(s: &str, dict: &HashMap<String, String>) -> String {
+    humanize_prose(s, dict).trim().to_string()
+}
+
 /// Stream one block through Ollama, emitting sentences as they complete.
 async fn stream_block(
     cfg: &OllamaConfig,
     block: &Block,
     kind: PromptKind,
     locale: &str,
+    dict: &HashMap<String, String>,
     emit: &Emitter,
 ) -> StreamOutcome {
     let mut streamer = SentenceStreamer::new(locale);
@@ -275,7 +286,8 @@ async fn stream_block(
                 return;
             }
             for s in streamer.push(delta) {
-                if s.trim().is_empty() {
+                let s = speakable(&s, dict);
+                if s.is_empty() {
                     continue;
                 }
                 if !emit.emit(s, block) {
@@ -294,7 +306,8 @@ async fn stream_block(
     match result {
         Ok(()) => {
             for s in streamer.flush() {
-                if s.trim().is_empty() {
+                let s = speakable(&s, dict);
+                if s.is_empty() {
                     continue;
                 }
                 if !emit.emit(s, block) {

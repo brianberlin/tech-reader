@@ -11,6 +11,7 @@ mod blocks;
 mod cache;
 #[macro_use]
 mod diag;
+mod highlight;
 mod humanize;
 mod narrate;
 mod ollama;
@@ -243,6 +244,39 @@ fn parse_fail_set() -> HashSet<usize> {
         .unwrap_or_default()
 }
 
+/// Install SIGINT/SIGTERM/SIGHUP handlers that set (and return) a shared
+/// "interrupted" flag. The long-lived loops (TUI event loop, headless drain)
+/// poll it and break to the normal teardown, which drops the audio stream **on
+/// its owning thread** — the cpal stream is `!Send`, so it can only be closed
+/// there, never from a handler (and a handler may do no real work anyway). The
+/// terminal-key Ctrl+C is handled separately by the TUI (raw mode turns off
+/// ISIG, so Ctrl+C never raises SIGINT while the TUI is up); this covers the
+/// signals that *do* reach the process — terminal close / `kill` (SIGTERM,
+/// SIGHUP) and SIGINT in the non-raw-mode windows (download, headless). Without
+/// it those kill the process with the CoreAudio output unit still open, which
+/// can wedge system audio on macOS.
+#[cfg(unix)]
+fn install_interrupt_flag() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    for sig in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
+        // A failed registration is non-fatal — we just lose graceful teardown
+        // for that one signal; log it and carry on.
+        if let Err(e) = signal_hook::flag::register(sig, Arc::clone(&flag)) {
+            crate::diag!("[signal] could not install handler for signal {sig}: {e}");
+        }
+    }
+    flag
+}
+
+#[cfg(not(unix))]
+fn install_interrupt_flag() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
 fn main() {
     let code = match run() {
         Ok(()) => exit::OK,
@@ -316,6 +350,11 @@ fn run() -> std::result::Result<(), AppError> {
     let cancel = Arc::new(AtomicBool::new(false));
     let narrator_done = Arc::new(AtomicBool::new(false));
     let synth_idle = Arc::new(AtomicBool::new(false));
+
+    // Set by a signal handler on SIGINT/SIGTERM/SIGHUP; polled by the TUI and
+    // headless loops so they break to the normal teardown (which drops the
+    // audio stream) instead of the process being killed with it still open.
+    let interrupted = install_interrupt_flag();
 
     // Transport (seek/speed) shared with the spine, synth worker, and TUI.
     // TECH_READER_SPEED sets the initial speed (mainly so headless renders can be
@@ -456,9 +495,11 @@ fn run() -> std::result::Result<(), AppError> {
         let res = tui::run(
             Arc::clone(&sentences),
             Arc::clone(&source_lines),
+            lang.clone(),
             &spine,
             Arc::clone(&transport),
             Arc::clone(&synth_idle),
+            Arc::clone(&interrupted),
         );
         cancel.store(true, Ordering::Relaxed);
         spine.stop_audio();
@@ -472,7 +513,7 @@ fn run() -> std::result::Result<(), AppError> {
         diag::set_quiet(false); // TTY but no device — let diagnostics through
     }
     let started = Instant::now();
-    spine.wait_until_drained(Duration::from_secs(3600));
+    spine.wait_until_drained(Duration::from_secs(3600), &interrupted);
     cancel.store(true, Ordering::Relaxed); // release the synth worker if it idles
     let _ = narrator.join();
     let synth_result = synth.join();

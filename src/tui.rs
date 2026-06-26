@@ -15,7 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -28,6 +31,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::audio::Spine;
+use crate::highlight::{self, Token};
 use crate::transport::Transport;
 use crate::types::Sentence;
 
@@ -96,18 +100,22 @@ impl Default for View {
 pub fn run(
     sentences: Arc<Mutex<Vec<Sentence>>>,
     source_lines: Arc<[String]>,
+    lang: String,
     spine: &Spine,
     transport: Arc<Transport>,
     synth_idle: Arc<AtomicBool>,
+    interrupted: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let mut terminal = setup()?;
     let res = event_loop(
         &mut terminal,
         &sentences,
         &source_lines,
+        &lang,
         spine,
         &transport,
         &synth_idle,
+        &interrupted,
     );
     restore(&mut terminal);
     res
@@ -116,12 +124,12 @@ pub fn run(
 fn setup() -> io::Result<Terminal<Backend>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     // Restore the terminal on panic so a crash doesn't wreck the user's shell.
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = io::stdout();
-        let _ = execute!(out, LeaveAlternateScreen);
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         prev(info);
     }));
@@ -130,19 +138,25 @@ fn setup() -> io::Result<Terminal<Backend>> {
 
 fn restore(terminal: &mut Terminal<Backend>) {
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn event_loop(
     terminal: &mut Terminal<Backend>,
     sentences: &Arc<Mutex<Vec<Sentence>>>,
     source_lines: &[String],
+    lang: &str,
     spine: &Spine,
     transport: &Transport,
     synth_idle: &AtomicBool,
+    interrupted: &AtomicBool,
 ) -> io::Result<()> {
     let mut view = View::default();
+    // Syntax-highlighted source, computed once the first time the source pane is
+    // shown — users who never open it pay nothing.
+    let mut highlighted: Option<Vec<Vec<Token>>> = None;
 
     loop {
         // Resolve the audible sentence first (locks the boundary table only), so
@@ -164,25 +178,34 @@ fn event_loop(
         }
 
         {
+            if matches!(view.pane, Pane::Source) && highlighted.is_none() {
+                highlighted = Some(highlight::highlight_lines(source_lines, lang));
+            }
             let sents = sentences.lock().unwrap();
             if !sents.is_empty() {
                 view.selected = view.selected.min(sents.len() - 1);
             }
-            terminal.draw(|f| ui(f, &sents, source_lines, current, &view, &status))?;
+            terminal.draw(|f| {
+                ui(f, &sents, source_lines, highlighted.as_deref(), current, &view, &status)
+            })?;
         }
 
-        // A dead device means the highlight can never advance — leave.
-        if spine.is_consumer_dead() {
+        // A dead device means the highlight can never advance — leave. A signal
+        // (terminal close / kill, or SIGINT outside raw mode) means the user
+        // wants out — break to the caller's teardown so the audio stream is
+        // dropped on its owning thread rather than leaked by an abrupt exit.
+        if spine.is_consumer_dead() || interrupted.load(Ordering::Relaxed) {
             break;
         }
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // The transport position to act from: the audible sentence,
                     // or the browse cursor before playback has started.
                     let pos = current.unwrap_or(view.selected);
-                    let total = sentences.lock().unwrap().len();
+                    let sents = sentences.lock().unwrap();
+                    let total = sents.len();
                     match key.code {
                         KeyCode::Char(' ') | KeyCode::Char('p') => {
                             spine.set_paused(!spine.is_paused());
@@ -199,12 +222,23 @@ fn event_loop(
                             change_speed(transport, &mut view, pos, 1)
                         }
                         _ => {
-                            if handle_key(key, &mut view, total) {
+                            if handle_key(key, &mut view, &sents) {
                                 break; // quit
                             }
                         }
                     }
                 }
+                Event::Mouse(me) => {
+                    // Wheel scroll browses (stops auto-follow) — one step per
+                    // event, block-aware in the source pane (see move_selection).
+                    let sents = sentences.lock().unwrap();
+                    match me.kind {
+                        MouseEventKind::ScrollDown => move_selection(&mut view, &sents, true),
+                        MouseEventKind::ScrollUp => move_selection(&mut view, &sents, false),
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -240,19 +274,13 @@ fn change_speed(transport: &Transport, view: &mut View, current: usize, delta: i
 }
 
 /// Apply a scroll/quit key. Returns true to quit.
-fn handle_key(key: KeyEvent, view: &mut View, total: usize) -> bool {
-    let last = total.saturating_sub(1);
+fn handle_key(key: KeyEvent, view: &mut View, sentences: &[Sentence]) -> bool {
+    let last = sentences.len().saturating_sub(1);
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
-        KeyCode::Up | KeyCode::Char('k') => {
-            view.follow = false;
-            view.selected = view.selected.saturating_sub(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            view.follow = false;
-            view.selected = (view.selected + 1).min(last);
-        }
+        KeyCode::Up | KeyCode::Char('k') => move_selection(view, sentences, false),
+        KeyCode::Down | KeyCode::Char('j') => move_selection(view, sentences, true),
         KeyCode::PageUp => {
             view.follow = false;
             view.selected = view.selected.saturating_sub(10);
@@ -277,10 +305,47 @@ fn handle_key(key: KeyEvent, view: &mut View, total: usize) -> bool {
     false
 }
 
+/// Move the browse cursor one step (stopping auto-follow). In the prose pane a
+/// step is one sentence; in the source pane it is one *block* — consecutive
+/// sentences often share a source-line range, so a per-sentence step would
+/// leave the highlight visually frozen for several presses (it would take
+/// multiple keystrokes to reach a sentence whose range differs). Stepping by
+/// block makes one press always advance the visible region.
+fn move_selection(view: &mut View, sentences: &[Sentence], forward: bool) {
+    view.follow = false;
+    let last = sentences.len().saturating_sub(1);
+    view.selected = match view.pane {
+        Pane::Prose => {
+            if forward {
+                (view.selected + 1).min(last)
+            } else {
+                view.selected.saturating_sub(1)
+            }
+        }
+        Pane::Source => next_block(sentences, view.selected, forward),
+    };
+}
+
+/// The index of the next sentence (in `forward` direction) whose source-line
+/// range differs from the one at `from` — i.e. the start of the adjacent block.
+/// Clamps to the ends when there is no further block.
+fn next_block(sentences: &[Sentence], from: usize, forward: bool) -> usize {
+    let last = sentences.len().saturating_sub(1);
+    let range_of = |i: usize| sentences.get(i).map(|s| (s.start_line, s.end_line));
+    let here = range_of(from);
+    if forward {
+        ((from + 1)..=last).find(|&j| range_of(j) != here).unwrap_or(last)
+    } else {
+        (0..from).rev().find(|&j| range_of(j) != here).unwrap_or(0)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ui(
     frame: &mut Frame,
     sentences: &[Sentence],
     source_lines: &[String],
+    highlighted: Option<&[Vec<Token>]>,
     current: Option<usize>,
     view: &View,
     status: &Status,
@@ -296,7 +361,9 @@ fn ui(
 
     match view.pane {
         Pane::Prose => render_prose(frame, rows[1], sentences, current, view),
-        Pane::Source => render_source(frame, rows[1], source_lines, sentences, current, view),
+        Pane::Source => {
+            render_source(frame, rows[1], source_lines, highlighted, sentences, current, view)
+        }
     }
 
     frame.render_widget(footer(view), rows[2]);
@@ -370,15 +437,16 @@ fn render_prose(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// Source view: the original document with the narrated region highlighted. The
-/// playhead's block is painted cyan; while browsing, the selected sentence's
-/// block is painted yellow. ListState is used only to scroll the active block
-/// into view — the highlight itself is per-line styling (a block spans many
-/// rows, which `highlight_style` cannot express).
+/// Source view: the original document with syntax highlighting. The narrated
+/// block is marked by a cyan bar in the gutter, the browse selection by a yellow
+/// bar — the code's own syntax colours are kept intact (no background), and
+/// ListState scrolls the active block into view.
+#[allow(clippy::too_many_arguments)]
 fn render_source(
     frame: &mut Frame,
     area: Rect,
     source_lines: &[String],
+    highlighted: Option<&[Vec<Token>]>,
     sentences: &[Sentence],
     current: Option<usize>,
     view: &View,
@@ -392,64 +460,72 @@ fn render_source(
     };
     let playhead_range = current.and_then(&range_of);
     let browse_range = (!view.follow).then(|| range_of(view.selected)).flatten();
-
-    let total = source_lines.len();
-    let gutter_digits = total.to_string().len();
-    // Gutter is "<n> │ ": digits + space + bar + space.
-    let gutter_w = gutter_digits + 3;
-    let content_w = (area.width as usize).saturating_sub(gutter_w).max(1);
-
-    let playhead = playhead_style();
-    let selection = selection_style();
-    let gutter_style = Style::default().fg(Color::DarkGray);
     let contains = |range: Option<(usize, usize)>, line_no: usize| {
         matches!(range, Some((lo, hi)) if line_no >= lo && line_no <= hi)
     };
 
+    let total = source_lines.len();
+    let gutter_digits = total.to_string().len();
+    // Gutter is "<n> <bar> ": digits + space + bar + space.
+    let gutter_w = gutter_digits + 3;
+    let content_w = (area.width as usize).saturating_sub(gutter_w).max(1);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let yellow = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+
     let items: Vec<ListItem> = source_lines
         .iter()
         .enumerate()
-        .map(|(i, text)| {
+        .map(|(i, raw)| {
             let line_no = i + 1; // 1-based, to match block ranges
-            // Browse selection wins over the playhead on overlap, matching prose.
-            let base = if contains(browse_range, line_no) {
-                selection
+            // Gutter bar marks the narrated (cyan) / selected (yellow) block;
+            // selection wins on overlap while browsing, matching the prose pane.
+            let (bar, bar_style) = if contains(browse_range, line_no) {
+                ('┃', yellow)
             } else if contains(playhead_range, line_no) {
-                playhead
+                ('┃', cyan)
             } else {
-                Style::default().fg(Color::Gray)
+                ('│', dim)
             };
-            let highlighted = contains(browse_range, line_no) || contains(playhead_range, line_no);
 
-            let rows: Vec<String> = if view.wrap_source {
-                wrap(text, content_w)
-            } else {
-                vec![text.chars().take(content_w).collect()]
+            // The line's styled runs: cached syntax spans, else a plain fallback.
+            let tokens = match highlighted.and_then(|h| h.get(i)) {
+                Some(t) => t.clone(),
+                None => plain_tokens(raw),
             };
+            let rows = if view.wrap_source {
+                wrap_tokens(&tokens, content_w)
+            } else {
+                vec![truncate_tokens(&tokens, content_w)]
+            };
+
             let lines: Vec<Line> = rows
                 .into_iter()
                 .enumerate()
-                .map(|(ri, mut row)| {
-                    // Fill highlighted rows to the content width so the block
-                    // reads as a solid bar rather than ragged-right.
-                    if highlighted {
-                        let pad = content_w.saturating_sub(row.chars().count());
-                        row.extend(std::iter::repeat_n(' ', pad));
-                    }
-                    let gutter = if ri == 0 {
-                        format!("{line_no:>gutter_digits$} │ ")
+                .map(|(ri, row)| {
+                    let num = if ri == 0 {
+                        format!("{line_no:>gutter_digits$} ")
                     } else {
-                        format!("{:gutter_digits$} │ ", "")
+                        format!("{:gutter_digits$} ", "")
                     };
-                    Line::from(vec![Span::styled(gutter, gutter_style), Span::styled(row, base)])
+                    let mut spans = vec![
+                        Span::styled(num, dim),
+                        Span::styled(bar.to_string(), bar_style),
+                        Span::raw(" "),
+                    ];
+                    spans.extend(row.into_iter().map(|t| {
+                        Span::styled(t.text, Style::default().fg(t.fg).add_modifier(t.modifier))
+                    }));
+                    Line::from(spans)
                 })
                 .collect();
             ListItem::new(Text::from(lines))
         })
         .collect();
 
-    // Scroll the first line of the active block into view (no highlight styling
-    // here — appearance is entirely per-line above).
+    // Scroll the first line of the active block into view (ListState is used
+    // only for scrolling — the highlight is the gutter bar above).
     let anchor = if view.follow { playhead_range } else { browse_range }
         .map(|(lo, _)| lo)
         .unwrap_or(1)
@@ -460,6 +536,72 @@ fn render_source(
     let mut state = ListState::default();
     state.select(Some(anchor));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Plain (uncoloured) spans for one raw source line, tabs expanded. Empty line
+/// still yields one empty row so the gutter renders.
+fn plain_tokens(raw: &str) -> Vec<Token> {
+    let expanded = raw.replace('\t', "    ");
+    if expanded.is_empty() {
+        Vec::new()
+    } else {
+        vec![Token {
+            fg: Color::Gray,
+            modifier: Modifier::empty(),
+            text: expanded,
+        }]
+    }
+}
+
+/// Column hard-wrap that preserves each run's colour/modifier (word-wrap with
+/// styled runs is a later refinement). Always returns at least one row.
+fn wrap_tokens(tokens: &[Token], width: usize) -> Vec<Vec<Token>> {
+    if width == 0 {
+        return vec![tokens.to_vec()];
+    }
+    let mut rows: Vec<Vec<Token>> = Vec::new();
+    let mut cur: Vec<Token> = Vec::new();
+    let mut cur_w = 0usize;
+    for tok in tokens {
+        for ch in tok.text.chars() {
+            if cur_w == width {
+                rows.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            push_char(&mut cur, ch, tok.fg, tok.modifier);
+            cur_w += 1;
+        }
+    }
+    rows.push(cur); // the last (possibly empty) row
+    rows
+}
+
+/// Truncate styled runs to `width` columns, preserving colour/modifier.
+fn truncate_tokens(tokens: &[Token], width: usize) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::new();
+    let mut w = 0usize;
+    for tok in tokens {
+        for ch in tok.text.chars() {
+            if w == width {
+                return out;
+            }
+            push_char(&mut out, ch, tok.fg, tok.modifier);
+            w += 1;
+        }
+    }
+    out
+}
+
+/// Append `ch` to `row`, extending the last run when its style matches.
+fn push_char(row: &mut Vec<Token>, ch: char, fg: Color, modifier: Modifier) {
+    match row.last_mut() {
+        Some(last) if last.fg == fg && last.modifier == modifier => last.text.push(ch),
+        _ => row.push(Token {
+            fg,
+            modifier,
+            text: ch.to_string(),
+        }),
+    }
 }
 
 fn header(total: usize, current: Option<usize>, view: &View, status: &Status) -> Paragraph<'static> {
@@ -589,10 +731,12 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Render one frame to a test buffer with the given panes/state.
+    /// Render one frame to a test buffer with the given panes/state. `hl` is the
+    /// optional syntax-highlight cache (None → the plain fallback).
     fn draw(
         sentences: &[Sentence],
         source_lines: &[String],
+        hl: Option<&[Vec<Token>]>,
         current: Option<usize>,
         view: &View,
         paused: bool,
@@ -605,7 +749,7 @@ mod tests {
             underruns: 0,
         };
         terminal
-            .draw(|f| ui(f, sentences, source_lines, current, view, &status))
+            .draw(|f| ui(f, sentences, source_lines, hl, current, view, &status))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -625,17 +769,17 @@ mod tests {
             selected: current.unwrap_or(0),
             ..View::default()
         };
-        draw(sentences, &[], current, &view, paused)
+        draw(sentences, &[], None, current, &view, paused)
     }
 
     /// Render the prose pane with an explicit `View`, so a test can set a browse
     /// cursor (`selected`) independent of the audible `current`.
     fn render_view(sentences: &[Sentence], current: Option<usize>, view: &View) -> Buffer {
-        draw(sentences, &[], current, view, false)
+        draw(sentences, &[], None, current, view, false)
     }
 
     /// The background colour of the first highlighted cell on the row holding
-    /// `needle`, if any (the per-row highlight is a solid block).
+    /// `needle`, if any (the prose pane's per-row highlight is a solid block).
     fn row_highlight_bg(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<Color> {
         for y in 0..buf.area.height {
             let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
@@ -643,6 +787,20 @@ mod tests {
                 return (0..buf.area.width)
                     .map(|x| buf[(x, y)].bg)
                     .find(|bg| *bg == Color::Cyan || *bg == Color::Yellow);
+            }
+        }
+        None
+    }
+
+    /// The fg colour of the source pane's gutter bar (the heavy `┃`) on the row
+    /// holding `needle`. `None` if that row has no heavy bar (i.e. unmarked).
+    fn row_gutter_marker(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<Color> {
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains(needle) {
+                return (0..buf.area.width)
+                    .find(|&x| buf[(x, y)].symbol() == "┃")
+                    .map(|x| buf[(x, y)].fg);
             }
         }
         None
@@ -830,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn source_pane_highlights_block_range() {
+    fn source_pane_marks_block_with_gutter_bar() {
         // Sentence 0 maps to a block spanning source lines 2..=3.
         let src = lines(&["one", "two", "three", "four", "five"]);
         let s = vec![sent("spoken text", 2, 3)];
@@ -838,12 +996,13 @@ mod tests {
             pane: Pane::Source,
             ..View::default()
         };
-        let buf = draw(&s, &src, Some(0), &view, false);
-        // The whole block (lines two & three) is cyan; lines outside it are not.
-        assert_eq!(row_highlight_bg(&buf, "two"), Some(Color::Cyan));
-        assert_eq!(row_highlight_bg(&buf, "three"), Some(Color::Cyan));
-        assert_eq!(row_highlight_bg(&buf, "one"), None);
-        assert_eq!(row_highlight_bg(&buf, "four"), None);
+        let buf = draw(&s, &src, None, Some(0), &view, false);
+        // The whole block (lines two & three) carries a cyan gutter bar; lines
+        // outside it have no heavy bar.
+        assert_eq!(row_gutter_marker(&buf, "two"), Some(Color::Cyan));
+        assert_eq!(row_gutter_marker(&buf, "three"), Some(Color::Cyan));
+        assert_eq!(row_gutter_marker(&buf, "one"), None);
+        assert_eq!(row_gutter_marker(&buf, "four"), None);
     }
 
     #[test]
@@ -857,16 +1016,16 @@ mod tests {
             selected: 1,
             ..View::default()
         };
-        let buf = draw(&s, &src, Some(0), &view, false);
+        let buf = draw(&s, &src, None, Some(0), &view, false);
         assert_eq!(
-            row_highlight_bg(&buf, "aaa"),
+            row_gutter_marker(&buf, "aaa"),
             Some(Color::Cyan),
-            "playhead line stays cyan while browsing the source"
+            "playhead block's gutter bar stays cyan while browsing"
         );
         assert_eq!(
-            row_highlight_bg(&buf, "ccc"),
+            row_gutter_marker(&buf, "ccc"),
             Some(Color::Yellow),
-            "browse selection in the source reads as a distinct colour"
+            "browse selection's gutter bar reads as a distinct colour"
         );
     }
 
@@ -878,29 +1037,90 @@ mod tests {
             pane: Pane::Source,
             ..View::default()
         };
-        let text = buffer_text(&draw(&s, &src, None, &view, false));
-        // The gutter numbers the source lines.
+        let text = buffer_text(&draw(&s, &src, None, None, &view, false));
+        // The gutter numbers the source lines (with a dim separator bar).
         assert!(text.contains("1 │ alpha"), "{text}");
         assert!(text.contains("2 │ beta"), "{text}");
+    }
+
+    #[test]
+    fn source_pane_applies_syntax_colours() {
+        // A hand-built highlight cache: line 1 has a red run; render must paint it.
+        let src = lines(&["let x = 1;"]);
+        let s = vec![sent("x", 1, 1)];
+        let red = Color::Rgb(200, 40, 40);
+        let hl = vec![vec![Token {
+            fg: red,
+            modifier: Modifier::empty(),
+            text: "let x = 1;".to_string(),
+        }]];
+        let view = View {
+            pane: Pane::Source,
+            ..View::default()
+        };
+        let buf = draw(&s, &src, Some(hl.as_slice()), None, &view, false);
+        let found = (0..buf.area.height).any(|y| {
+            (0..buf.area.width).any(|x| buf[(x, y)].fg == red && buf[(x, y)].symbol() != " ")
+        });
+        assert!(found, "syntax foreground colour should be rendered");
     }
 
     #[test]
     fn tab_toggles_pane() {
         let mut v = View::default();
         assert!(matches!(v.pane, Pane::Prose));
-        assert!(!handle_key(key(KeyCode::Tab), &mut v, 1));
+        assert!(!handle_key(key(KeyCode::Tab), &mut v, &[]));
         assert!(matches!(v.pane, Pane::Source));
-        handle_key(key(KeyCode::Tab), &mut v, 1);
+        handle_key(key(KeyCode::Tab), &mut v, &[]);
         assert!(matches!(v.pane, Pane::Prose));
+    }
+
+    #[test]
+    fn source_pane_down_steps_by_block() {
+        // Three sentences in block A (lines 1..=2), two in block B (lines 5..=6).
+        let s = vec![
+            sent("a1", 1, 2),
+            sent("a2", 1, 2),
+            sent("a3", 1, 2),
+            sent("b1", 5, 6),
+            sent("b2", 5, 6),
+        ];
+        let mut v = View {
+            pane: Pane::Source,
+            follow: true,
+            selected: 0,
+            ..View::default()
+        };
+        // One Down jumps from block A straight to the first sentence of block B,
+        // instead of crawling sentence-by-sentence within block A.
+        handle_key(key(KeyCode::Down), &mut v, &s);
+        assert!(!v.follow);
+        assert_eq!(v.selected, 3, "Down should land on the next block");
+        // No further block: clamps at the last sentence.
+        handle_key(key(KeyCode::Down), &mut v, &s);
+        assert_eq!(v.selected, 4);
+        // Up jumps back to the previous block.
+        handle_key(key(KeyCode::Up), &mut v, &s);
+        assert_eq!(v.selected, 2, "Up should land on the previous block");
+    }
+
+    #[test]
+    fn prose_pane_down_steps_by_sentence() {
+        let s = prose(&["one", "two", "three"]);
+        let mut v = View::default();
+        handle_key(key(KeyCode::Down), &mut v, &s);
+        assert_eq!(v.selected, 1);
+        handle_key(key(KeyCode::Down), &mut v, &s);
+        assert_eq!(v.selected, 2);
     }
 
     #[test]
     fn w_toggles_source_wrap() {
         let mut v = View::default();
         assert!(v.wrap_source, "wrapping is on by default");
-        handle_key(key(KeyCode::Char('w')), &mut v, 1);
+        handle_key(key(KeyCode::Char('w')), &mut v, &[]);
         assert!(!v.wrap_source);
-        handle_key(key(KeyCode::Char('w')), &mut v, 1);
+        handle_key(key(KeyCode::Char('w')), &mut v, &[]);
         assert!(v.wrap_source);
     }
 }
