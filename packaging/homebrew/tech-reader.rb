@@ -12,9 +12,9 @@
 class TechReader < Formula
   desc "Reads code, comments, and specs aloud-but-explained (local Ollama + neural TTS)"
   homepage "https://github.com/brianberlin/tech-reader"
-  url "https://github.com/brianberlin/tech-reader/releases/download/v0.1.0/tech-reader-0.1.0-arm64-darwin.tar.gz"
-  sha256 "20538508fc3492203095f5f21943b833cb38603bf8985b1b9cd0f933134cbd84"
-  version "0.1.0"
+  url "https://github.com/brianberlin/tech-reader/releases/download/v0.1.1/tech-reader-0.1.1-arm64-darwin.tar.gz"
+  sha256 "18eb5ce9202734039349dba8de364a8851be6a09c133995a5ae40f36ef21cb1f"
+  version "0.1.1"
   license "MIT"
 
   # macOS Apple Silicon is the supported target (N5). Intel (x86_64) is a
